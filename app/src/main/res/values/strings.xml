@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">TeraBox Virtual Cloud Storage</string>
-    <string name="provider_label">TeraBox Cloud Drive</string>
-    <string name="sync_channel_name">TeraBox Sync</string>
-    <string name="upload_channel_name">TeraBox Uploads</string>
+    <string name="app_name">CloudSSD Media</string>
+    <string name="provider_label">CloudSSD Google Drive</string>
+    <string name="media_channel_name">CloudSSD Media Playback</string>
+    <string name="prefetch_channel_name">CloudSSD Prefetch Service</string>
 </resources>

@@ -1,27 +1,29 @@
 package com.terabox.vfs.ui
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
-import android.os.Environment
 import android.provider.DocumentsContract
-import android.provider.OpenableColumns
-import android.webkit.CookieManager
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.OptIn
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -30,27 +32,36 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.WorkManager
+import androidx.compose.ui.window.DialogProperties
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.ui.PlayerView
+import coil.compose.AsyncImage
 import com.terabox.vfs.TeraBoxApp
-import com.terabox.vfs.data.AccountModel
-import com.terabox.vfs.data.FileNodeModel
-import com.terabox.vfs.data.TeraBoxApiClient
-import com.terabox.vfs.provider.TeraBoxDocumentsProvider
-import com.terabox.vfs.sync.AccountSyncWorker
+import com.terabox.vfs.data.DriveAccount
+import com.terabox.vfs.data.DriveSessionExpiredException
+import com.terabox.vfs.data.FileEntity
+import com.terabox.vfs.data.PinnedEntity
+import com.terabox.vfs.provider.CloudSSDDocumentsProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 
+@OptIn(UnstableApi::class)
 class MainActivity : ComponentActivity() {
+
+    private val app by lazy { TeraBoxApp.instance }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -58,127 +69,133 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
-                    primary = Color(0xFF1E88E5),
-                    background = Color(0xFF121212),
+                    primary = Color(0xFF42A5F5),
+                    secondary = Color(0xFF26A69A),
                     surface = Color(0xFF1E1E1E),
-                    onBackground = Color.White,
-                    onSurface = Color.White
+                    background = Color(0xFF121212)
                 )
             ) {
-                MainApp()
+                CloudSSDMainScreen()
             }
         }
     }
 
-    @OptIn(ExperimentalMaterial3Api::class)
+    override fun onDestroy() {
+        super.onDestroy()
+        app.playerManager.release()
+    }
+
     @Composable
-    fun MainApp() {
-        val app = TeraBoxApp.instance
+    fun CloudSSDMainScreen() {
         val scope = rememberCoroutineScope()
-        val apiClient = remember { TeraBoxApiClient() }
+        var selectedTab by remember { mutableIntStateOf(0) } // 0: Library, 1: Player, 2: Offline, 3: Settings
 
-        var selectedTab by remember { mutableStateOf(1) } // Default to Files tab so user sees files immediately!
-        var accounts by remember { mutableStateOf(app.dbHelper.getAccounts()) }
-        var currentDir by remember { mutableStateOf("/") }
-        var fileList by remember { mutableStateOf<List<FileNodeModel>>(emptyList()) }
-        var searchQuery by remember { mutableStateOf("") }
+        var activeAccount by remember { mutableStateOf(app.dbHelper.getActiveAccount()) }
+        var showLoginDialog by remember { mutableStateOf(false) }
+
+        // Folder & File Navigation State
+        var currentFolderId by remember { mutableStateOf("root") }
+        val folderHistory = remember { mutableStateListOf<Pair<String, String>>() } // id to name
+        var filesList by remember { mutableStateOf(listOf<FileEntity>()) }
         var isLoading by remember { mutableStateOf(false) }
+        var isOffline by remember { mutableStateOf(!isNetworkAvailable(this@MainActivity)) }
+        var errorMessage by remember { mutableStateOf<String?>(null) }
 
-        // Dialog states
-        var showCookieInput by remember { mutableStateOf(false) }
-        var showWebViewLogin by remember { mutableStateOf(false) }
-        var showNewFolderDialog by remember { mutableStateOf(false) }
-        var showRenameDialog by remember { mutableStateOf<FileNodeModel?>(null) }
-        var showDeleteDialog by remember { mutableStateOf<FileNodeModel?>(null) }
+        // Search & Filter State
+        var searchQuery by remember { mutableStateOf("") }
+        var selectedFilter by remember { mutableStateOf("ALL") } // ALL, VIDEO, AUDIO, IMAGE
+        var isGridView by remember { mutableStateOf(false) }
+        var sortBy by remember { mutableStateOf("NAME") } // NAME, DATE, SIZE
 
-        // Progress Dialog states for real Upload & Download
-        var transferProgress by remember { mutableStateOf<Pair<String, Float>?>(null) }
+        // Player Overlay / State
+        var activePlayingFile by remember { mutableStateOf<FileEntity?>(null) }
+        var showImageViewer by remember { mutableStateOf<FileEntity?>(null) }
 
-        val activeAccount = accounts.firstOrNull { it.active }
+        // Pinning Progress
+        var pinningProgress by remember { mutableStateOf<Pair<String, Float>?>(null) }
 
-        // Refresh files from database or cloud
-        fun refreshFileList(forceCloud: Boolean = false) {
-            val acc = activeAccount ?: return
+        // Function to load children from DB and sync with Google Drive
+        fun refreshDirectory(folderId: String, forceCloud: Boolean = false) {
+            val acc = activeAccount
             scope.launch {
                 isLoading = true
-                if (forceCloud) {
-                    withContext(Dispatchers.IO) {
-                        val listRes = apiClient.listFiles(acc.ndus, currentDir)
-                        if (listRes.isSuccess) {
-                            val items = listRes.getOrDefault(emptyList())
-                            val nodes = items.map { item ->
-                                FileNodeModel(
-                                    fsId = item.fsId,
-                                    accountId = acc.id,
-                                    path = item.path,
-                                    parentPath = currentDir,
-                                    filename = item.filename,
-                                    isDir = item.isdir == 1,
-                                    size = item.size,
-                                    mtime = item.mtime,
-                                    dlink = item.dlink,
-                                    dlinkUpdatedAt = if (item.dlink != null) System.currentTimeMillis() else 0L,
-                                    isPinned = false
-                                )
-                            }
-                            app.dbHelper.insertOrUpdateNodes(nodes)
-                        }
-                    }
+                errorMessage = null
+                isOffline = !isNetworkAvailable(this@MainActivity)
+
+                // 1. Load from local cache first for instant UI response
+                filesList = withContext(Dispatchers.IO) {
+                    app.dbHelper.getChildren(folderId)
                 }
 
-                fileList = withContext(Dispatchers.IO) {
-                    if (searchQuery.isNotBlank()) {
-                        app.dbHelper.searchNodes(acc.id, searchQuery)
+                // 2. If online and (forced or cache is empty), sync with Drive API v3
+                if (!isOffline && acc != null && (forceCloud || filesList.isEmpty())) {
+                    val result = withContext(Dispatchers.IO) {
+                        try {
+                            // Also refresh quota and profile
+                            val aboutRes = app.apiClient.getAbout(acc.accessToken)
+                            aboutRes.getOrNull()?.let { (quota, user) ->
+                                val updated = acc.copy(
+                                    totalQuota = quota.limit,
+                                    usedQuota = quota.usage,
+                                    displayName = user?.displayName ?: acc.displayName,
+                                    email = user?.emailAddress ?: acc.email
+                                )
+                                app.dbHelper.saveAccount(updated)
+                                activeAccount = updated
+                            }
+
+                            val listRes = app.apiClient.listFiles(
+                                accessToken = acc.accessToken,
+                                folderId = folderId,
+                                mediaOnly = true
+                            )
+
+                            if (listRes.isSuccess) {
+                                val driveFiles = listRes.getOrNull()?.files ?: emptyList()
+                                val entities = driveFiles.map { df ->
+                                    FileEntity(
+                                        id = df.id,
+                                        name = df.name,
+                                        mimeType = df.mimeType,
+                                        parentId = folderId,
+                                        size = df.size,
+                                        modifiedTime = System.currentTimeMillis(),
+                                        md5Checksum = df.md5Checksum,
+                                        thumbnailLink = df.thumbnailLink,
+                                        isFolder = df.isFolder
+                                    )
+                                }
+                                app.dbHelper.upsertFiles(entities)
+                                Result.success(entities)
+                            } else {
+                                val ex = listRes.exceptionOrNull()
+                                Result.failure(ex ?: Exception("Drive list failed"))
+                            }
+                        } catch (e: Exception) {
+                            Result.failure(e)
+                        }
+                    }
+
+                    if (result.isSuccess) {
+                        filesList = withContext(Dispatchers.IO) {
+                            app.dbHelper.getChildren(folderId)
+                        }
                     } else {
-                        app.dbHelper.getChildren(acc.id, currentDir)
+                        val ex = result.exceptionOrNull()
+                        if (ex is DriveSessionExpiredException) {
+                            errorMessage = "Drive session expired. Tap to reconnect."
+                            showLoginDialog = true
+                        } else {
+                            errorMessage = ex?.message ?: "Error syncing with Drive"
+                        }
                     }
                 }
                 isLoading = false
             }
         }
 
-        LaunchedEffect(activeAccount, currentDir, searchQuery) {
-            refreshFileList(forceCloud = fileList.isEmpty())
-        }
-
-        // Native File Picker for Cloud Upload
-        val uploadPickerLauncher = rememberLauncherForActivityResult(
-            contract = ActivityResultContracts.GetContent()
-        ) { uri: Uri? ->
-            if (uri != null && activeAccount != null) {
-                val (fileName, fileSize) = getFileInfoFromUri(this@MainActivity, uri)
-                val targetRemotePath = if (currentDir == "/") "/$fileName" else "$currentDir/$fileName"
-
-                scope.launch {
-                    transferProgress = Pair("Uploading $fileName...", 0f)
-                    val success = withContext(Dispatchers.IO) {
-                        try {
-                            contentResolver.openInputStream(uri)?.use { stream ->
-                                val res = apiClient.uploadFile(
-                                    ndus = activeAccount.ndus,
-                                    remotePath = targetRemotePath,
-                                    filename = fileName,
-                                    inputStream = stream,
-                                    fileSize = fileSize
-                                ) { uploaded, total ->
-                                    val prog = if (total > 0) uploaded.toFloat() / total.toFloat() else 0.5f
-                                    transferProgress = Pair("Uploading $fileName (${(prog * 100).toInt()}%)...", prog)
-                                }
-                                res.isSuccess
-                            } ?: false
-                        } catch (e: Exception) {
-                            false
-                        }
-                    }
-                    transferProgress = null
-                    if (success) {
-                        Toast.makeText(this@MainActivity, "Uploaded $fileName to TeraBox!", Toast.LENGTH_SHORT).show()
-                        refreshFileList(forceCloud = true)
-                    } else {
-                        Toast.makeText(this@MainActivity, "Upload failed. Check connection.", Toast.LENGTH_LONG).show()
-                    }
-                }
-            }
+        LaunchedEffect(currentFolderId, activeAccount) {
+            refreshDirectory(currentFolderId, forceCloud = filesList.isEmpty())
         }
 
         Scaffold(
@@ -187,60 +204,66 @@ class MainActivity : ComponentActivity() {
                     title = {
                         Column {
                             Text(
-                                "TeraBox 1TB Virtual Storage",
+                                "CloudSSD Media",
                                 fontWeight = FontWeight.Bold,
-                                fontSize = 17.sp
+                                fontSize = 18.sp,
+                                color = Color.White
                             )
-                            if (activeAccount != null) {
-                                Text(
-                                    "${activeAccount.name} • 1,024 GB Cloud",
-                                    fontSize = 11.sp,
-                                    color = Color(0xFF81D4FA)
-                                )
-                            }
+                            Text(
+                                text = if (activeAccount != null) {
+                                    "${activeAccount?.displayName} • ${formatGb(activeAccount?.totalQuota ?: 0)} Cloud"
+                                } else "No Account Connected",
+                                fontSize = 11.sp,
+                                color = Color(0xFF81D4FA)
+                            )
                         }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = Color(0xFF1A1A1A),
+                        containerColor = Color(0xFF1E1E1E),
                         titleContentColor = Color.White
                     ),
                     actions = {
-                        IconButton(onClick = { refreshFileList(forceCloud = true) }) {
-                            Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Color(0xFF64B5F6))
+                        IconButton(onClick = { refreshDirectory(currentFolderId, forceCloud = true) }) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Color(0xFF42A5F5))
+                        }
+                        if (activeAccount == null) {
+                            Button(
+                                onClick = { showLoginDialog = true },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E88E5)),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                modifier = Modifier.padding(end = 8.dp)
+                            ) {
+                                Text("Sign In", fontSize = 12.sp)
+                            }
                         }
                     }
                 )
             },
             bottomBar = {
-                NavigationBar(containerColor = Color(0xFF1A1A1A)) {
+                NavigationBar(containerColor = Color(0xFF1E1E1E)) {
                     NavigationBarItem(
                         selected = selectedTab == 0,
                         onClick = { selectedTab = 0 },
-                        icon = { Icon(Icons.Default.Cloud, contentDescription = "1 TB Drive") },
-                        label = { Text("1 TB Drive") }
+                        icon = { Icon(Icons.Default.VideoLibrary, contentDescription = "Library") },
+                        label = { Text("Library") }
                     )
                     NavigationBarItem(
                         selected = selectedTab == 1,
                         onClick = { selectedTab = 1 },
-                        icon = { Icon(Icons.Default.Folder, contentDescription = "Files") },
-                        label = { Text("Cloud Files") }
+                        icon = { Icon(Icons.Default.PlayCircle, contentDescription = "Player") },
+                        label = { Text("Player") }
                     )
                     NavigationBarItem(
                         selected = selectedTab == 2,
                         onClick = { selectedTab = 2 },
-                        icon = { Icon(Icons.Default.Storage, contentDescription = "Cache") },
-                        label = { Text("Cache") }
+                        icon = { Icon(Icons.Default.PushPin, contentDescription = "Offline") },
+                        label = { Text("Offline") }
                     )
-                }
-            },
-            floatingActionButton = {
-                if (selectedTab == 1 && activeAccount != null) {
-                    ExtendedFloatingActionButton(
-                        onClick = { uploadPickerLauncher.launch("*/*") },
-                        containerColor = Color(0xFF1E88E5),
-                        contentColor = Color.White,
-                        icon = { Icon(Icons.Default.Upload, contentDescription = null) },
-                        text = { Text("Upload File") }
+                    NavigationBarItem(
+                        selected = selectedTab == 3,
+                        onClick = { selectedTab = 3 },
+                        icon = { Icon(Icons.Default.Settings, contentDescription = "Settings") },
+                        label = { Text("Settings") }
                     )
                 }
             }
@@ -251,75 +274,168 @@ class MainActivity : ComponentActivity() {
                     .padding(padding)
                     .background(Color(0xFF121212))
             ) {
-                when (selectedTab) {
-                    0 -> DriveDashboardTab(
-                        activeAccount = activeAccount,
-                        onConnectClick = { showCookieInput = true },
-                        onBrowserLoginClick = { showWebViewLogin = true }
-                    )
-                    1 -> NativeFileExplorerTab(
-                        activeAccount = activeAccount,
-                        currentDir = currentDir,
-                        fileList = fileList,
-                        searchQuery = searchQuery,
-                        isLoading = isLoading,
-                        onSearchChange = { searchQuery = it },
-                        onDirClick = { newDir -> currentDir = newDir },
-                        onUpClick = {
-                            if (currentDir != "/") {
-                                val clean = if (currentDir.endsWith("/")) currentDir.dropLast(1) else currentDir
-                                val lastSlash = clean.lastIndexOf('/')
-                                currentDir = if (lastSlash <= 0) "/" else clean.substring(0, lastSlash)
+                Column(modifier = Modifier.fillMaxSize()) {
+                    // Offline Banner
+                    if (isOffline) {
+                        Surface(
+                            color = Color(0xFFE65100),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.CloudOff, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    "Offline Mode: Showing cached media & pinned files",
+                                    color = Color.White,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
                             }
-                        },
-                        onUploadClick = { uploadPickerLauncher.launch("*/*") },
-                        onNewFolderClick = { showNewFolderDialog = true },
-                        onDownloadClick = { node ->
-                            scope.launch {
-                                transferProgress = Pair("Preparing download: ${node.filename}...", 0f)
-                                withContext(Dispatchers.IO) {
-                                    val dlinkRes = apiClient.getDownloadLink(activeAccount!!.ndus, node.fsId)
-                                    val dlink = dlinkRes.getOrNull()
-                                    if (dlink != null) {
-                                        val downloadDir = File(
-                                            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                                            "TeraBox"
-                                        ).apply { mkdirs() }
-                                        val destFile = File(downloadDir, node.filename)
+                        }
+                    }
 
-                                        apiClient.downloadFile(dlink, activeAccount.ndus, destFile) { down, tot ->
-                                            val p = if (tot > 0) down.toFloat() / tot.toFloat() else 0.5f
-                                            transferProgress = Pair("Downloading ${node.filename} (${(p * 100).toInt()}%)...", p)
+                    // Error Banner
+                    errorMessage?.let { msg ->
+                        Surface(
+                            color = Color(0xFFB71C1C),
+                            modifier = Modifier.fillMaxWidth().clickable { showLoginDialog = true }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.Warning, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text(msg, color = Color.White, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                                Text("Reconnect", color = Color(0xFF80D8FF), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+
+                    when (selectedTab) {
+                        0 -> LibraryTab(
+                            account = activeAccount,
+                            folderHistory = folderHistory,
+                            filesList = filesList,
+                            searchQuery = searchQuery,
+                            selectedFilter = selectedFilter,
+                            isGridView = isGridView,
+                            sortBy = sortBy,
+                            isLoading = isLoading,
+                            onSearchChange = { searchQuery = it },
+                            onFilterChange = { selectedFilter = it },
+                            onSortChange = { sortBy = it },
+                            onGridToggle = { isGridView = !isGridView },
+                            onFolderClick = { folder ->
+                                folderHistory.add(Pair(currentFolderId, if (folderHistory.isEmpty()) "Root" else folderHistory.last().second))
+                                currentFolderId = folder.id
+                            },
+                            onBreadcrumbClick = { index ->
+                                if (index < folderHistory.size) {
+                                    val target = folderHistory[index]
+                                    while (folderHistory.size > index) {
+                                        folderHistory.removeAt(folderHistory.lastIndex)
+                                    }
+                                    currentFolderId = target.first
+                                }
+                            },
+                            onRootBreadcrumbClick = {
+                                folderHistory.clear()
+                                currentFolderId = "root"
+                            },
+                            onFileClick = { file ->
+                                if (file.isImage) {
+                                    showImageViewer = file
+                                } else {
+                                    activePlayingFile = file
+                                    selectedTab = 1
+                                    activeAccount?.let { acc ->
+                                        app.playerManager.playMedia(file, filesList, acc.accessToken)
+                                    }
+                                }
+                            },
+                            onPinClick = { file ->
+                                scope.launch {
+                                    pinningProgress = Pair("Pinning ${file.name}...", 0.05f)
+                                    val acc = activeAccount
+                                    if (acc != null) {
+                                        val destFile = File(app.cacheManager.pinnedDir, "${file.id}_${file.name}")
+                                        val res = withContext(Dispatchers.IO) {
+                                            app.apiClient.downloadFileForPin(acc.accessToken, file.id, destFile) { down, total ->
+                                                val p = if (total > 0) down.toFloat() / total.toFloat() else 0.5f
+                                                pinningProgress = Pair("Pinning ${file.name} (${(p * 100).toInt()}%)...", p)
+                                            }
+                                        }
+                                        pinningProgress = null
+                                        if (res.isSuccess) {
+                                            app.dbHelper.pinFile(file.id, destFile.absolutePath, destFile.length())
+                                            Toast.makeText(this@MainActivity, "Pinned '${file.name}' for offline use!", Toast.LENGTH_SHORT).show()
+                                            refreshDirectory(currentFolderId)
+                                        } else {
+                                            Toast.makeText(this@MainActivity, "Pin failed: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
                                         }
                                     }
                                 }
-                                transferProgress = null
-                                Toast.makeText(this@MainActivity, "Saved to Downloads/TeraBox/${node.filename}", Toast.LENGTH_LONG).show()
-                            }
-                        },
-                        onPlayClick = { node ->
-                            // Open in external media player (VLC, MX Player) using SAF URI
-                            try {
-                                val docId = TeraBoxDocumentsProvider.buildDocId(activeAccount!!.id, node.fsId)
-                                val uri = DocumentsContract.buildDocumentUri(TeraBoxDocumentsProvider.AUTHORITY, docId)
-                                val intent = Intent(Intent.ACTION_VIEW).apply {
-                                    setDataAndType(uri, getMimeType(node.filename))
-                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            },
+                            onExternalOpen = { file ->
+                                try {
+                                    val uri = DocumentsContract.buildDocumentUri(CloudSSDDocumentsProvider.AUTHORITY, file.id)
+                                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                                        setDataAndType(uri, file.mimeType)
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    }
+                                    startActivity(Intent.createChooser(intent, "Open in VLC or Player"))
+                                } catch (e: Exception) {
+                                    Toast.makeText(this@MainActivity, "Cannot open: ${e.message}", Toast.LENGTH_SHORT).show()
                                 }
-                                startActivity(Intent.createChooser(intent, "Open with..."))
-                            } catch (e: Exception) {
-                                Toast.makeText(this@MainActivity, "Cannot open: ${e.message}", Toast.LENGTH_SHORT).show()
+                            },
+                            onSignInClick = { showLoginDialog = true }
+                        )
+                        1 -> PlayerTab(
+                            activeFile = activePlayingFile,
+                            onFileSelect = { activePlayingFile = it }
+                        )
+                        2 -> OfflinePinnedTab(
+                            onPlayFile = { pinned ->
+                                val entity = app.dbHelper.getFile(pinned.fileId) ?: FileEntity(
+                                    id = pinned.fileId,
+                                    name = File(pinned.localPath).name,
+                                    mimeType = "video/*",
+                                    parentId = "root",
+                                    size = pinned.fileSize,
+                                    modifiedTime = pinned.pinnedAt,
+                                    md5Checksum = null,
+                                    thumbnailLink = null,
+                                    isFolder = false
+                                )
+                                activePlayingFile = entity
+                                selectedTab = 1
+                                app.playerManager.playMedia(entity, listOf(entity), "")
+                            },
+                            onUnpin = { pinned ->
+                                File(pinned.localPath).delete()
+                                app.dbHelper.unpinFile(pinned.fileId)
+                                Toast.makeText(this@MainActivity, "Unpinned file", Toast.LENGTH_SHORT).show()
                             }
-                        },
-                        onRenameClick = { node -> showRenameDialog = node },
-                        onDeleteClick = { node -> showDeleteDialog = node }
-                    )
-                    2 -> CacheTab()
+                        )
+                        3 -> SettingsTab(
+                            account = activeAccount,
+                            onSignOut = {
+                                app.dbHelper.clearActiveAccount()
+                                activeAccount = null
+                                Toast.makeText(this@MainActivity, "Signed out", Toast.LENGTH_SHORT).show()
+                            },
+                            onSignInClick = { showLoginDialog = true }
+                        )
+                    }
                 }
 
-                // Transfer progress overlay
-                transferProgress?.let { (msg, prog) ->
+                // Pinning Progress Dialog
+                pinningProgress?.let { (msg, prog) ->
                     Dialog(onDismissRequest = {}) {
                         Card(
                             colors = CardDefaults.cardColors(containerColor = Color(0xFF222222)),
@@ -327,559 +443,243 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.fillMaxWidth().padding(16.dp)
                         ) {
                             Column(modifier = Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text(msg, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                Text(msg, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color.White)
                                 Spacer(Modifier.height(16.dp))
                                 LinearProgressIndicator(
                                     progress = { prog },
                                     modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
-                                    color = Color(0xFF1E88E5)
+                                    color = Color(0xFF42A5F5)
                                 )
                             }
                         }
                     }
                 }
-            }
-        }
 
-        // Direct Cookie Setup Dialog (100% Native, No WebViews!)
-        if (showCookieInput) {
-            var cookieText by remember { mutableStateOf("") }
-            AlertDialog(
-                onDismissRequest = { showCookieInput = false },
-                title = { Text("Connect TeraBox 1TB Storage") },
-                text = {
-                    Column {
-                        Text(
-                            "Enter your TeraBox 'ndus' cookie to grant 1,024 GB virtual storage to this phone:",
-                            fontSize = 13.sp,
-                            color = Color.LightGray
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        OutlinedTextField(
-                            value = cookieText,
-                            onValueChange = { cookieText = it },
-                            placeholder = { Text("Paste ndus=...") },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            val clean = cookieText.trim().removePrefix("ndus=").trim()
-                            if (clean.isNotBlank()) {
-                                showCookieInput = false
-                                scope.launch {
-                                    val quotaRes = withContext(Dispatchers.IO) { apiClient.getQuota(clean) }
-                                    val quota = quotaRes.getOrNull()
-                                    val acc = AccountModel(
-                                        id = "terabox_main",
-                                        name = "TeraBox 1TB Drive",
-                                        ndus = clean,
-                                        totalQuota = quota?.total ?: (1024L * 1024L * 1024L * 1024L),
-                                        usedQuota = quota?.used ?: 0L,
-                                        active = true
-                                    )
-                                    app.dbHelper.upsertAccount(acc)
-                                    accounts = app.dbHelper.getAccounts()
-                                    selectedTab = 1
-                                    refreshFileList(forceCloud = true)
-                                    Toast.makeText(this@MainActivity, "1 TB Virtual Storage Connected!", Toast.LENGTH_LONG).show()
-                                }
-                            }
-                        }
-                    ) {
-                        Text("Connect 1TB Drive")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showCookieInput = false }) { Text("Cancel") }
-                }
-            )
-        }
-
-        // Optional Quick Web Login (auto-closes once cookie is captured)
-        if (showWebViewLogin) {
-            Dialog(onDismissRequest = { showWebViewLogin = false }) {
-                Card(
-                    modifier = Modifier.fillMaxWidth().fillMaxHeight(0.85f),
-                    shape = RoundedCornerShape(16.dp)
-                ) {
-                    AndroidView(
-                        modifier = Modifier.fillMaxSize(),
-                        factory = { ctx ->
-                            WebView(ctx).apply {
-                                settings.javaScriptEnabled = true
-                                settings.domStorageEnabled = true
-                                settings.userAgentString = TeraBoxApiClient.USER_AGENT
-                                webViewClient = object : WebViewClient() {
-                                    override fun onPageFinished(view: WebView?, url: String?) {
-                                        val cookieStr = CookieManager.getInstance().getCookie(url)
-                                        if (cookieStr != null && cookieStr.contains("ndus=")) {
-                                            val ndus = cookieStr.split(";")
-                                                .map { it.trim() }
-                                                .firstOrNull { it.startsWith("ndus=") }
-                                                ?.removePrefix("ndus=")
-                                            if (!ndus.isNullOrEmpty()) {
-                                                showWebViewLogin = false
-                                                scope.launch {
-                                                    val quotaRes = withContext(Dispatchers.IO) { apiClient.getQuota(ndus) }
-                                                    val quota = quotaRes.getOrNull()
-                                                    val acc = AccountModel(
-                                                        id = "terabox_main",
-                                                        name = "TeraBox 1TB Drive",
-                                                        ndus = ndus,
-                                                        totalQuota = quota?.total ?: (1024L * 1024L * 1024L * 1024L),
-                                                        usedQuota = quota?.used ?: 0L,
-                                                        active = true
-                                                    )
-                                                    app.dbHelper.upsertAccount(acc)
-                                                    accounts = app.dbHelper.getAccounts()
-                                                    selectedTab = 1
-                                                    refreshFileList(forceCloud = true)
-                                                    Toast.makeText(this@MainActivity, "TeraBox Connected Successfully!", Toast.LENGTH_LONG).show()
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                loadUrl("https://www.terabox.com/main")
-                            }
-                        }
+                // Image Viewer Overlay (Swipe & Zoom)
+                showImageViewer?.let { imgFile ->
+                    ImageViewerDialog(
+                        file = imgFile,
+                        accessToken = activeAccount?.accessToken ?: "",
+                        onDismiss = { showImageViewer = null }
                     )
                 }
-            }
-        }
 
-        // New Folder Dialog
-        if (showNewFolderDialog) {
-            var folderName by remember { mutableStateOf("") }
-            AlertDialog(
-                onDismissRequest = { showNewFolderDialog = false },
-                title = { Text("Create New Folder") },
-                text = {
-                    OutlinedTextField(
-                        value = folderName,
-                        onValueChange = { folderName = it },
-                        placeholder = { Text("Folder Name") },
-                        modifier = Modifier.fillMaxWidth()
+                // Login & Google Auth Dialog
+                if (showLoginDialog) {
+                    LoginDialog(
+                        onDismiss = { showLoginDialog = false },
+                        onConnected = { acc ->
+                            activeAccount = acc
+                            showLoginDialog = false
+                            refreshDirectory("root", forceCloud = true)
+                            Toast.makeText(this@MainActivity, "Connected to Google Drive!", Toast.LENGTH_LONG).show()
+                        }
                     )
-                },
-                confirmButton = {
-                    Button(onClick = {
-                        val trimmed = folderName.trim()
-                        if (trimmed.isNotBlank() && activeAccount != null) {
-                            showNewFolderDialog = false
-                            scope.launch {
-                                val target = if (currentDir == "/") "/$trimmed" else "$currentDir/$trimmed"
-                                val res = withContext(Dispatchers.IO) { apiClient.createFolder(activeAccount.ndus, target) }
-                                if (res.isSuccess) {
-                                    Toast.makeText(this@MainActivity, "Folder created!", Toast.LENGTH_SHORT).show()
-                                    refreshFileList(forceCloud = true)
-                                } else {
-                                    Toast.makeText(this@MainActivity, "Failed to create folder", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                        }
-                    }) {
-                        Text("Create")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showNewFolderDialog = false }) { Text("Cancel") }
-                }
-            )
-        }
-
-        // Rename Dialog
-        showRenameDialog?.let { node ->
-            var newName by remember { mutableStateOf(node.filename) }
-            AlertDialog(
-                onDismissRequest = { showRenameDialog = null },
-                title = { Text("Rename ${if (node.isDir) "Folder" else "File"}") },
-                text = {
-                    OutlinedTextField(
-                        value = newName,
-                        onValueChange = { newName = it },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                },
-                confirmButton = {
-                    Button(onClick = {
-                        val trimmed = newName.trim()
-                        if (trimmed.isNotBlank() && activeAccount != null) {
-                            showRenameDialog = null
-                            scope.launch {
-                                val res = withContext(Dispatchers.IO) {
-                                    apiClient.renameItem(activeAccount.ndus, node.path, trimmed)
-                                }
-                                if (res.isSuccess) {
-                                    val newPath = node.path.substringBeforeLast('/') + "/$trimmed"
-                                    app.dbHelper.renameNode(node.fsId, trimmed, newPath)
-                                    refreshFileList(forceCloud = true)
-                                    Toast.makeText(this@MainActivity, "Renamed successfully", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    Toast.makeText(this@MainActivity, "Rename failed", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                        }
-                    }) {
-                        Text("Rename")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showRenameDialog = null }) { Text("Cancel") }
-                }
-            )
-        }
-
-        // Delete Dialog
-        showDeleteDialog?.let { node ->
-            AlertDialog(
-                onDismissRequest = { showDeleteDialog = null },
-                title = { Text("Delete ${if (node.isDir) "Folder" else "File"}?") },
-                text = { Text("Are you sure you want to delete '${node.filename}' from your TeraBox cloud?") },
-                confirmButton = {
-                    Button(
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F)),
-                        onClick = {
-                            showDeleteDialog = null
-                            scope.launch {
-                                val res = withContext(Dispatchers.IO) {
-                                    apiClient.deleteItem(activeAccount!!.ndus, node.path)
-                                }
-                                if (res.isSuccess) {
-                                    app.dbHelper.deleteNode(node.fsId)
-                                    refreshFileList(forceCloud = true)
-                                    Toast.makeText(this@MainActivity, "Deleted '${node.filename}'", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    Toast.makeText(this@MainActivity, "Delete failed", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                        }
-                    ) {
-                        Text("Delete")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showDeleteDialog = null }) { Text("Cancel") }
-                }
-            )
-        }
-    }
-
-    @Composable
-    fun DriveDashboardTab(
-        activeAccount: AccountModel?,
-        onConnectClick: () -> Unit,
-        onBrowserLoginClick: () -> Unit
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            if (activeAccount != null) {
-                val totalGb = activeAccount.totalQuota.toFloat() / (1024f * 1024f * 1024f)
-                val usedGb = activeAccount.usedQuota.toFloat() / (1024f * 1024f * 1024f)
-                val freeGb = (totalGb - usedGb).coerceAtLeast(0f)
-                val fraction = if (totalGb > 0) (usedGb / totalGb).coerceIn(0f, 1f) else 0f
-
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
-                    shape = RoundedCornerShape(16.dp)
-                ) {
-                    Column(modifier = Modifier.padding(20.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.CloudCircle, contentDescription = null, tint = Color(0xFF42A5F5), modifier = Modifier.size(36.dp))
-                            Spacer(Modifier.width(12.dp))
-                            Column {
-                                Text("1,024 GB Cloud Storage", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                                Text(activeAccount.name, fontSize = 12.sp, color = Color.Gray)
-                            }
-                        }
-                        Spacer(Modifier.height(20.dp))
-                        LinearProgressIndicator(
-                            progress = { fraction },
-                            modifier = Modifier.fillMaxWidth().height(10.dp).clip(RoundedCornerShape(5.dp)),
-                            color = Color(0xFF42A5F5),
-                            trackColor = Color(0xFF333333)
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(String.format("%.2f GB used", usedGb), fontSize = 13.sp, color = Color.LightGray)
-                            Text(String.format("%.2f GB FREE", freeGb), fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF81D4FA))
-                        }
-                    }
-                }
-
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0F3024)),
-                    shape = RoundedCornerShape(16.dp)
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color(0xFF4CAF50))
-                            Spacer(Modifier.width(8.dp))
-                            Text("1 TB Virtual Storage Granted to Phone", fontWeight = FontWeight.Bold, color = Color(0xFFA5D6A7))
-                        }
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            "TeraBox is directly mounted into Android's native Files app and Storage Access Framework. GameHub, VLC, and emulators can access your game ISOs, ROMs, and movies with zero local storage footprint.",
-                            fontSize = 12.sp,
-                            color = Color.White
-                        )
-                    }
-                }
-            } else {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
-                    shape = RoundedCornerShape(16.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Icon(Icons.Default.CloudSync, contentDescription = null, modifier = Modifier.size(56.dp), tint = Color(0xFF42A5F5))
-                        Spacer(Modifier.height(12.dp))
-                        Text("Connect Your 1 TB Storage", fontWeight = FontWeight.Bold, fontSize = 20.sp)
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            "Grant 1,024 GB of virtual cloud storage directly to your Android phone without eating your internal memory.",
-                            fontSize = 13.sp,
-                            color = Color.Gray,
-                            lineHeight = 18.sp
-                        )
-                        Spacer(Modifier.height(20.dp))
-                        Button(
-                            onClick = onConnectClick,
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E88E5))
-                        ) {
-                            Icon(Icons.Default.Key, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("Connect via Session Cookie (Instant)")
-                        }
-                        Spacer(Modifier.height(10.dp))
-                        OutlinedButton(
-                            onClick = onBrowserLoginClick,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(Icons.Default.Language, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("Quick Browser Login")
-                        }
-                    }
                 }
             }
         }
     }
 
+    // --- Tab 0: Media Library Screen ---
     @Composable
-    fun NativeFileExplorerTab(
-        activeAccount: AccountModel?,
-        currentDir: String,
-        fileList: List<FileNodeModel>,
+    fun LibraryTab(
+        account: DriveAccount?,
+        folderHistory: List<Pair<String, String>>,
+        filesList: List<FileEntity>,
         searchQuery: String,
+        selectedFilter: String,
+        isGridView: Boolean,
+        sortBy: String,
         isLoading: Boolean,
         onSearchChange: (String) -> Unit,
-        onDirClick: (String) -> Unit,
-        onUpClick: () -> Unit,
-        onUploadClick: () -> Unit,
-        onNewFolderClick: () -> Unit,
-        onDownloadClick: (FileNodeModel) -> Unit,
-        onPlayClick: (FileNodeModel) -> Unit,
-        onRenameClick: (FileNodeModel) -> Unit,
-        onDeleteClick: (FileNodeModel) -> Unit
+        onFilterChange: (String) -> Unit,
+        onSortChange: (String) -> Unit,
+        onGridToggle: () -> Unit,
+        onFolderClick: (FileEntity) -> Unit,
+        onBreadcrumbClick: (Int) -> Unit,
+        onRootBreadcrumbClick: () -> Unit,
+        onFileClick: (FileEntity) -> Unit,
+        onPinClick: (FileEntity) -> Unit,
+        onExternalOpen: (FileEntity) -> Unit,
+        onSignInClick: () -> Unit
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            if (activeAccount == null) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Connect your TeraBox account in '1 TB Drive' tab first.", color = Color.Gray)
+            if (account == null) {
+                Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Default.CloudSync, contentDescription = null, tint = Color(0xFF42A5F5), modifier = Modifier.size(56.dp))
+                            Spacer(Modifier.height(16.dp))
+                            Text("Connect Google Drive", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Color.White)
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                "Turn Google Drive into high-speed virtual extra storage. Stream 500 GB+ media with only a small 5 GB cache on your phone.",
+                                textAlign = TextAlign.Center,
+                                color = Color.Gray,
+                                fontSize = 13.sp
+                            )
+                            Spacer(Modifier.height(20.dp))
+                            Button(
+                                onClick = onSignInClick,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E88E5)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Default.Key, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Connect Drive Account")
+                            }
+                        }
+                    }
                 }
                 return
             }
 
-            // Action Toolbar (Upload File & New Folder directly in app!)
+            // Search Bar & Grid/List Toggle
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF1A1A1A))
+                    .background(Color(0xFF1E1E1E))
                     .padding(horizontal = 12.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Button(
-                    onClick = onUploadClick,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E88E5)),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                    shape = RoundedCornerShape(8.dp)
-                ) {
-                    Icon(Icons.Default.UploadFile, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("Upload", fontSize = 12.sp)
-                }
-
-                OutlinedButton(
-                    onClick = onNewFolderClick,
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                    shape = RoundedCornerShape(8.dp)
-                ) {
-                    Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("New Folder", fontSize = 12.sp)
-                }
-
-                Spacer(Modifier.weight(1f))
-
                 OutlinedTextField(
                     value = searchQuery,
                     onValueChange = onSearchChange,
-                    modifier = Modifier.width(160.dp),
-                    placeholder = { Text("Search...", fontSize = 12.sp) },
+                    modifier = Modifier.weight(1f).height(48.dp),
+                    placeholder = { Text("Search videos, audio, images...", fontSize = 12.sp) },
                     singleLine = true,
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Color(0xFF1E88E5),
-                        unfocusedBorderColor = Color(0xFF444444)
+                        focusedBorderColor = Color(0xFF42A5F5),
+                        unfocusedBorderColor = Color(0xFF333333)
                     )
                 )
+                Spacer(Modifier.width(8.dp))
+                IconButton(onClick = onGridToggle) {
+                    Icon(
+                        imageVector = if (isGridView) Icons.Default.ViewList else Icons.Default.GridView,
+                        contentDescription = "Toggle View",
+                        tint = Color.LightGray
+                    )
+                }
             }
 
-            // Breadcrumb path navigation bar
+            // Filter Chips (All, Videos, Audio, Images)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF242424))
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .background(Color(0xFF181818))
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                if (currentDir != "/") {
-                    IconButton(onClick = onUpClick, modifier = Modifier.size(24.dp)) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color(0xFF42A5F5))
-                    }
-                    Spacer(Modifier.width(8.dp))
-                }
-                Text(
-                    text = if (currentDir == "/") "TeraBox Root (/)" else currentDir,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = Color.LightGray,
-                    maxLines = 1
+                FilterChip(
+                    selected = selectedFilter == "ALL",
+                    onClick = { onFilterChange("ALL") },
+                    label = { Text("All Media", fontSize = 11.sp) }
+                )
+                FilterChip(
+                    selected = selectedFilter == "VIDEO",
+                    onClick = { onFilterChange("VIDEO") },
+                    label = { Text("Videos", fontSize = 11.sp) },
+                    leadingIcon = { Icon(Icons.Default.Videocam, contentDescription = null, modifier = Modifier.size(14.dp)) }
+                )
+                FilterChip(
+                    selected = selectedFilter == "AUDIO",
+                    onClick = { onFilterChange("AUDIO") },
+                    label = { Text("Audio", fontSize = 11.sp) },
+                    leadingIcon = { Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(14.dp)) }
+                )
+                FilterChip(
+                    selected = selectedFilter == "IMAGE",
+                    onClick = { onFilterChange("IMAGE") },
+                    label = { Text("Images", fontSize = 11.sp) },
+                    leadingIcon = { Icon(Icons.Default.Image, contentDescription = null, modifier = Modifier.size(14.dp)) }
                 )
             }
 
-            if (isLoading) {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp), color = Color(0xFF1E88E5))
+            // Breadcrumb Navigation
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF222222))
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Drive Root",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF81D4FA),
+                    modifier = Modifier.clickable { onRootBreadcrumbClick() }
+                )
+                folderHistory.forEachIndexed { idx, crumb ->
+                    Text(" / ", color = Color.Gray, fontSize = 12.sp)
+                    Text(
+                        text = crumb.second,
+                        fontSize = 12.sp,
+                        color = Color(0xFF81D4FA),
+                        modifier = Modifier.clickable { onBreadcrumbClick(idx) }
+                    )
+                }
             }
 
-            if (fileList.isEmpty() && !isLoading) {
+            if (isLoading) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp), color = Color(0xFF42A5F5))
+            }
+
+            // Filtered & Sorted File List
+            val displayList = remember(filesList, searchQuery, selectedFilter, sortBy) {
+                filesList.filter { file ->
+                    val matchesSearch = searchQuery.isBlank() || file.name.contains(searchQuery, ignoreCase = true)
+                    val matchesFilter = when (selectedFilter) {
+                        "VIDEO" -> file.isFolder || file.isVideo
+                        "AUDIO" -> file.isFolder || file.isAudio
+                        "IMAGE" -> file.isFolder || file.isImage
+                        else -> true
+                    }
+                    matchesSearch && matchesFilter
+                }.sortedWith(
+                    when (sortBy) {
+                        "SIZE" -> compareByDescending<FileEntity> { it.isFolder }.thenByDescending { it.size }
+                        "DATE" -> compareByDescending<FileEntity> { it.isFolder }.thenByDescending { it.modifiedTime }
+                        else -> compareByDescending<FileEntity> { it.isFolder }.thenBy { it.name.lowercase() }
+                    }
+                )
+            }
+
+            if (displayList.isEmpty() && !isLoading) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(48.dp), tint = Color.DarkGray)
                         Spacer(Modifier.height(8.dp))
-                        Text("No files in this folder", color = Color.Gray, fontSize = 14.sp)
-                        Spacer(Modifier.height(12.dp))
-                        Button(onClick = onUploadClick) {
-                            Text("Upload File to this Folder")
-                        }
+                        Text("No media files found in this folder", color = Color.Gray, fontSize = 13.sp)
+                    }
+                }
+            } else if (isGridView) {
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(3),
+                    modifier = Modifier.fillMaxSize().padding(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(displayList) { item ->
+                        MediaGridCard(
+                            item = item,
+                            onClick = { if (item.isFolder) onFolderClick(item) else onFileClick(item) }
+                        )
                     }
                 }
             } else {
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(fileList) { node ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    if (node.isDir) {
-                                        onDirClick(node.path)
-                                    } else {
-                                        onPlayClick(node)
-                                    }
-                                }
-                                .padding(horizontal = 14.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            // Specialized Type Icon
-                            Icon(
-                                imageVector = when {
-                                    node.isDir -> Icons.Default.Folder
-                                    isGameFile(node.filename) -> Icons.Default.SportsEsports
-                                    isVideoFile(node.filename) -> Icons.Default.VideoLibrary
-                                    isAudioFile(node.filename) -> Icons.Default.AudioFile
-                                    isImageFile(node.filename) -> Icons.Default.Image
-                                    else -> Icons.Default.InsertDriveFile
-                                },
-                                contentDescription = null,
-                                tint = when {
-                                    node.isDir -> Color(0xFFFFB74D)
-                                    isGameFile(node.filename) -> Color(0xFFE91E63)
-                                    isVideoFile(node.filename) -> Color(0xFF42A5F5)
-                                    isAudioFile(node.filename) -> Color(0xFF66BB6A)
-                                    else -> Color(0xFF90CAF9)
-                                },
-                                modifier = Modifier.size(32.dp)
-                            )
-
-                            Spacer(Modifier.width(12.dp))
-
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    node.filename,
-                                    fontWeight = FontWeight.Medium,
-                                    fontSize = 14.sp,
-                                    maxLines = 1
-                                )
-                                Spacer(Modifier.height(2.dp))
-                                Text(
-                                    text = if (node.isDir) "Folder" else "${formatSize(node.size)} • ${formatDate(node.mtime)}",
-                                    fontSize = 11.sp,
-                                    color = Color.Gray
-                                )
-                            }
-
-                            // File Context Actions (Download, Play, Rename, Delete)
-                            if (!node.isDir) {
-                                IconButton(onClick = { onPlayClick(node) }) {
-                                    Icon(Icons.Default.PlayCircle, contentDescription = "Play/Open", tint = Color(0xFF42A5F5))
-                                }
-                                IconButton(onClick = { onDownloadClick(node) }) {
-                                    Icon(Icons.Default.Download, contentDescription = "Download to Phone", tint = Color(0xFF81C784))
-                                }
-                            }
-
-                            var showItemMenu by remember { mutableStateOf(false) }
-                            Box {
-                                IconButton(onClick = { showItemMenu = true }) {
-                                    Icon(Icons.Default.MoreVert, contentDescription = "More", tint = Color.LightGray)
-                                }
-                                DropdownMenu(
-                                    expanded = showItemMenu,
-                                    onDismissRequest = { showItemMenu = false }
-                                ) {
-                                    DropdownMenuItem(
-                                        text = { Text("Rename") },
-                                        leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null) },
-                                        onClick = {
-                                            showItemMenu = false
-                                            onRenameClick(node)
-                                        }
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text("Delete", color = Color(0xFFE57373)) },
-                                        leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null, tint = Color(0xFFE57373)) },
-                                        onClick = {
-                                            showItemMenu = false
-                                            onDeleteClick(node)
-                                        }
-                                    )
-                                }
-                            }
-                        }
+                    items(displayList) { item ->
+                        MediaListItem(
+                            item = item,
+                            onItemClick = { if (item.isFolder) onFolderClick(item) else onFileClick(item) },
+                            onPinClick = { onPinClick(item) },
+                            onExternalOpen = { onExternalOpen(item) }
+                        )
                         Divider(color = Color(0xFF1E1E1E))
                     }
                 }
@@ -887,126 +687,721 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // --- Tab 1: ExoPlayer Media Player ---
     @Composable
-    fun CacheTab() {
-        val app = TeraBoxApp.instance
-        var cacheSizeMb by remember { mutableStateOf(app.cacheManager.getTotalCacheSizeBytes() / (1024 * 1024)) }
-        var maxCacheGb by remember { mutableStateOf(app.cacheManager.getMaxCacheSizeBytes() / (1024f * 1024f * 1024f)) }
+    fun PlayerTab(
+        activeFile: FileEntity?,
+        onFileSelect: (FileEntity) -> Unit
+    ) {
+        val player = app.playerManager.exoPlayer
+        var isPlaying by remember { mutableStateOf(player.isPlaying) }
+        var currentPosition by remember { mutableLongStateOf(player.currentPosition) }
+        var duration by remember { mutableLongStateOf(player.duration.coerceAtLeast(0L)) }
+        var selectedSpeed by remember { mutableFloatStateOf(1.0f) }
+
+        // Periodic ticker for seek bar
+        LaunchedEffect(Unit) {
+            while (true) {
+                isPlaying = player.isPlaying
+                currentPosition = player.currentPosition.coerceAtLeast(0L)
+                duration = player.duration.coerceAtLeast(0L)
+                delay(500)
+            }
+        }
+
+        if (activeFile == null) {
+            Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.PlayCircleOutline, contentDescription = null, modifier = Modifier.size(64.dp), tint = Color.DarkGray)
+                    Spacer(Modifier.height(12.dp))
+                    Text("No media playing", fontWeight = FontWeight.Bold, color = Color.White, fontSize = 16.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text("Select a video or audio file from your Drive Library to stream.", color = Color.Gray, fontSize = 13.sp)
+                }
+            }
+            return
+        }
 
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+                .background(Color.Black)
         ) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
-                shape = RoundedCornerShape(16.dp)
+            // Video Surface or Audio Album View
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center
             ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("Local Smart Cache", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Spacer(Modifier.height(4.dp))
-                    Text("Cached Blocks on Phone: $cacheSizeMb MB", fontSize = 13.sp, color = Color.LightGray)
-                    Spacer(Modifier.height(16.dp))
-                    Text("Max Cache Budget: ${maxCacheGb.toInt()} GB", fontSize = 13.sp)
-                    Slider(
-                        value = maxCacheGb,
-                        onValueChange = {
-                            maxCacheGb = it
-                            app.cacheManager.setMaxCacheSizeGb(it.toLong())
+                if (activeFile.isVideo) {
+                    AndroidView(
+                        factory = { ctx ->
+                            PlayerView(ctx).apply {
+                                this.player = player
+                                useController = false
+                            }
                         },
-                        valueRange = 2f..20f,
-                        steps = 18
+                        modifier = Modifier.fillMaxSize()
                     )
-                    Spacer(Modifier.height(12.dp))
-                    Button(
+                } else {
+                    // Audio waveform/cover representation
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Surface(
+                            shape = CircleShape,
+                            color = Color(0xFF1E88E5).copy(alpha = 0.2f),
+                            modifier = Modifier.size(120.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(Icons.Default.MusicNote, contentDescription = null, tint = Color(0xFF42A5F5), modifier = Modifier.size(56.dp))
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        Text(activeFile.name, fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color.White, maxLines = 1)
+                        Text("Google Drive Cloud Audio", fontSize = 12.sp, color = Color.Gray)
+                    }
+                }
+            }
+
+            // Controls Bar
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF1E1E1E))
+                    .padding(16.dp)
+            ) {
+                Text(
+                    text = activeFile.name,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    color = Color.White,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "${formatSize(activeFile.size)} • Smart Cached Stream (15 MB Prefetch Active)",
+                    fontSize = 11.sp,
+                    color = Color(0xFF81D4FA)
+                )
+
+                Spacer(Modifier.height(12.dp))
+
+                // Seek Slider
+                val sliderPosition = if (duration > 0) (currentPosition.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else 0f
+                Slider(
+                    value = sliderPosition,
+                    onValueChange = { frac ->
+                        val target = (frac * duration).toLong()
+                        player.seekTo(target)
+                        currentPosition = target
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(formatTime(currentPosition), fontSize = 11.sp, color = Color.Gray)
+                    Text(formatTime(duration), fontSize = 11.sp, color = Color.Gray)
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                // Playback Control Buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Speed selector
+                    TextButton(onClick = {
+                        val speeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+                        val nextIdx = (speeds.indexOf(selectedSpeed) + 1) % speeds.size
+                        selectedSpeed = speeds[nextIdx]
+                        app.playerManager.setSpeed(selectedSpeed)
+                    }) {
+                        Text("${selectedSpeed}x", fontWeight = FontWeight.Bold, color = Color(0xFF42A5F5))
+                    }
+
+                    // 10s Rewind
+                    IconButton(onClick = { app.playerManager.seekBackward(10000L) }) {
+                        Icon(Icons.Default.Replay10, contentDescription = "Rewind 10s", tint = Color.White)
+                    }
+
+                    // Play / Pause
+                    FloatingActionButton(
                         onClick = {
-                            app.cacheManager.clearAllUnpinnedCache(emptySet())
-                            cacheSizeMb = app.cacheManager.getTotalCacheSizeBytes() / (1024 * 1024)
-                            Toast.makeText(this@MainActivity, "Cache Cleared", Toast.LENGTH_SHORT).show()
+                            if (player.isPlaying) {
+                                app.playerManager.pause()
+                            } else {
+                                app.playerManager.resume()
+                            }
+                            isPlaying = player.isPlaying
                         },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F)),
-                        modifier = Modifier.fillMaxWidth()
+                        containerColor = Color(0xFF1E88E5),
+                        contentColor = Color.White,
+                        modifier = Modifier.size(56.dp)
                     ) {
-                        Text("Clear All Cached Blocks")
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = "Play/Pause"
+                        )
+                    }
+
+                    // 10s Forward
+                    IconButton(onClick = { app.playerManager.seekForward(10000L) }) {
+                        Icon(Icons.Default.Forward10, contentDescription = "Forward 10s", tint = Color.White)
+                    }
+
+                    // Background Audio Indicator
+                    IconButton(onClick = {
+                        Toast.makeText(this@MainActivity, "Background audio active with screen off", Toast.LENGTH_SHORT).show()
+                    }) {
+                        Icon(Icons.Default.Headphones, contentDescription = "Background", tint = Color(0xFF4CAF50))
                     }
                 }
             }
         }
     }
 
-    private fun isGameFile(name: String): Boolean {
-        val lower = name.lowercase()
-        return lower.endsWith(".iso") || lower.endsWith(".cso") || lower.endsWith(".bin") ||
-                lower.endsWith(".chd") || lower.endsWith(".rom") || lower.endsWith(".nsp") ||
-                lower.endsWith(".xci") || lower.endsWith(".apk")
+    // --- Tab 2: Offline (Pinned) Screen ---
+    @Composable
+    fun OfflinePinnedTab(
+        onPlayFile: (PinnedEntity) -> Unit,
+        onUnpin: (PinnedEntity) -> Unit
+    ) {
+        var pinnedList by remember { mutableStateOf(app.dbHelper.getPinnedFiles()) }
+        val totalBytes = app.dbHelper.getTotalPinnedSizeBytes()
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp)
+        ) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.PushPin, contentDescription = null, tint = Color(0xFF4CAF50), modifier = Modifier.size(36.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text("Pinned Media Storage", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color.White)
+                        Text(
+                            "${pinnedList.size} files pinned • ${formatSize(totalBytes)} (Exempt from LRU cache eviction)",
+                            fontSize = 12.sp,
+                            color = Color.LightGray
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            if (pinnedList.isEmpty()) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(Icons.Default.CloudQueue, contentDescription = null, modifier = Modifier.size(56.dp), tint = Color.DarkGray)
+                        Spacer(Modifier.height(12.dp))
+                        Text("No Pinned Files", fontWeight = FontWeight.Bold, color = Color.White, fontSize = 16.sp)
+                        Spacer(Modifier.height(4.dp))
+                        Text("Tap the 3 dots on any media in your Library to pin it for offline flights or travel.", color = Color.Gray, fontSize = 13.sp, textAlign = TextAlign.Center)
+                    }
+                }
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(pinnedList) { item ->
+                        val fileName = File(item.localPath).name
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A1A)),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(14.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.OfflinePin, contentDescription = null, tint = Color(0xFF4CAF50))
+                                Spacer(Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(fileName, fontWeight = FontWeight.Medium, fontSize = 14.sp, color = Color.White, maxLines = 1)
+                                    Text("${formatSize(item.fileSize)} • Airplane Mode Ready", fontSize = 11.sp, color = Color.Gray)
+                                }
+                                IconButton(onClick = { onPlayFile(item) }) {
+                                    Icon(Icons.Default.PlayArrow, contentDescription = "Play", tint = Color(0xFF42A5F5))
+                                }
+                                IconButton(onClick = {
+                                    onUnpin(item)
+                                    pinnedList = app.dbHelper.getPinnedFiles()
+                                }) {
+                                    Icon(Icons.Default.DeleteOutline, contentDescription = "Unpin", tint = Color(0xFFE57373))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    private fun isVideoFile(name: String): Boolean {
-        val lower = name.lowercase()
-        return lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".avi") ||
-                lower.endsWith(".mov") || lower.endsWith(".webm") || lower.endsWith(".flv")
+    // --- Tab 3: Settings Screen ---
+    @Composable
+    fun SettingsTab(
+        account: DriveAccount?,
+        onSignOut: () -> Unit,
+        onSignInClick: () -> Unit
+    ) {
+        var cacheCapGb by remember { mutableFloatStateOf(app.cacheManager.getCacheCapGb()) }
+        var currentCacheMb by remember { mutableLongStateOf(app.cacheManager.getCurrentLruCacheSizeBytes() / (1024 * 1024)) }
+        var wifiOnly by remember { mutableStateOf(app.dbHelper.isWifiOnlyPrefetch()) }
+        var prefetchEnabled by remember { mutableStateOf(app.dbHelper.isPrefetchEnabled()) }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // Google Drive Account Info Card
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("Cloud Backing Account", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color(0xFF81D4FA))
+                    Spacer(Modifier.height(10.dp))
+                    if (account != null) {
+                        Text(account.displayName, fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color.White)
+                        Text(account.email, fontSize = 12.sp, color = Color.Gray)
+                        Spacer(Modifier.height(8.dp))
+                        val usedGb = account.usedQuota.toFloat() / (1024f * 1024f * 1024f)
+                        val totalGb = account.totalQuota.toFloat() / (1024f * 1024f * 1024f)
+                        val frac = if (totalGb > 0) (usedGb / totalGb).coerceIn(0f, 1f) else 0f
+                        LinearProgressIndicator(
+                            progress = { frac },
+                            modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
+                            color = Color(0xFF42A5F5)
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            String.format("%.2f GB used of %.2f GB Google Drive", usedGb, totalGb),
+                            fontSize = 11.sp,
+                            color = Color.LightGray
+                        )
+                    } else {
+                        Text("No Google Drive connected", color = Color.Gray, fontSize = 13.sp)
+                        Spacer(Modifier.height(8.dp))
+                        Button(onClick = onSignInClick) { Text("Sign In to Drive") }
+                    }
+                }
+            }
+
+            // Smart Cache Cap (1 to 20 GB)
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("Smart Cache Limit (LRU Eviction)", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.White)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Currently Cached: $currentCacheMb MB • Limit: ${cacheCapGb.toInt()} GB",
+                        fontSize = 12.sp,
+                        color = Color.LightGray
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Slider(
+                        value = cacheCapGb,
+                        onValueChange = {
+                            cacheCapGb = it
+                            app.cacheManager.setCacheCapGb(it)
+                        },
+                        valueRange = 1f..20f,
+                        steps = 18
+                    )
+                    Text(
+                        "When cache exceeds ${cacheCapGb.toInt()} GB, the oldest accessed chunks are evicted automatically. Pinned files are never evicted.",
+                        fontSize = 11.sp,
+                        color = Color.Gray
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    Button(
+                        onClick = {
+                            app.cacheManager.clearLruCache()
+                            currentCacheMb = app.cacheManager.getCurrentLruCacheSizeBytes() / (1024 * 1024)
+                            Toast.makeText(this@MainActivity, "Cache Cleared!", Toast.LENGTH_SHORT).show()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF37474F)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.DeleteSweep, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Clear Cache Now")
+                    }
+                }
+            }
+
+            // Prefetch Rules
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("Prefetch Engine Rules", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.White)
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("15 MB Next-Item Prefetch", fontWeight = FontWeight.Medium, fontSize = 13.sp, color = Color.White)
+                            Text("Pre-buffers the start of the next track/episode", fontSize = 11.sp, color = Color.Gray)
+                        }
+                        Switch(
+                            checked = prefetchEnabled,
+                            onCheckedChange = {
+                                prefetchEnabled = it
+                                app.dbHelper.setPrefetchEnabled(it)
+                            }
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Wi-Fi Only Prefetch", fontWeight = FontWeight.Medium, fontSize = 13.sp, color = Color.White)
+                            Text("Saves mobile data by only prefetching on Wi-Fi", fontSize = 11.sp, color = Color.Gray)
+                        }
+                        Switch(
+                            checked = wifiOnly,
+                            onCheckedChange = {
+                                wifiOnly = it
+                                app.dbHelper.setWifiOnlyPrefetch(it)
+                            }
+                        )
+                    }
+                }
+            }
+
+            // Android Native Storage Framework (Phase 2 SAF)
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF0F3024)),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color(0xFF4CAF50))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Virtual Storage Mounted in Android", fontWeight = FontWeight.Bold, color = Color(0xFFA5D6A7))
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Google Drive is directly exposed to Android's native Files app, VLC, and external media players via Storage Access Framework with zero local storage footprint.",
+                        fontSize = 11.sp,
+                        color = Color.White,
+                        lineHeight = 16.sp
+                    )
+                }
+            }
+
+            if (account != null) {
+                Button(
+                    onClick = onSignOut,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.Logout, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Sign Out")
+                }
+            }
+        }
     }
 
-    private fun isAudioFile(name: String): Boolean {
-        val lower = name.lowercase()
-        return lower.endsWith(".mp3") || lower.endsWith(".flac") || lower.endsWith(".wav") ||
-                lower.endsWith(".aac") || lower.endsWith(".ogg") || lower.endsWith(".m4a")
+    // --- Sub-components ---
+
+    @Composable
+    fun MediaListItem(
+        item: FileEntity,
+        onItemClick: () -> Unit,
+        onPinClick: () -> Unit,
+        onExternalOpen: () -> Unit
+    ) {
+        var showMenu by remember { mutableStateOf(false) }
+        val isPinned = remember(item.id) { app.dbHelper.isPinned(item.id) }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onItemClick() }
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = when {
+                    item.isFolder -> Icons.Default.Folder
+                    item.isVideo -> Icons.Default.VideoLibrary
+                    item.isAudio -> Icons.Default.AudioFile
+                    item.isImage -> Icons.Default.Image
+                    else -> Icons.Default.InsertDriveFile
+                },
+                contentDescription = null,
+                tint = when {
+                    item.isFolder -> Color(0xFFFFB74D)
+                    item.isVideo -> Color(0xFF42A5F5)
+                    item.isAudio -> Color(0xFF66BB6A)
+                    item.isImage -> Color(0xFFAB47BC)
+                    else -> Color.LightGray
+                },
+                modifier = Modifier.size(32.dp)
+            )
+
+            Spacer(Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = item.name,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 14.sp,
+                        color = Color.White,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (isPinned) {
+                        Spacer(Modifier.width(6.dp))
+                        Icon(Icons.Default.PushPin, contentDescription = "Pinned", tint = Color(0xFF4CAF50), modifier = Modifier.size(14.dp))
+                    }
+                }
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = if (item.isFolder) "Folder" else "${formatSize(item.size)} • ${if (isPinned) "Pinned Offline" else "Drive Stream"}",
+                    fontSize = 11.sp,
+                    color = Color.Gray
+                )
+            }
+
+            if (!item.isFolder) {
+                IconButton(onClick = onItemClick) {
+                    Icon(Icons.Default.PlayCircle, contentDescription = "Play", tint = Color(0xFF42A5F5))
+                }
+            }
+
+            Box {
+                IconButton(onClick = { showMenu = true }) {
+                    Icon(Icons.Default.MoreVert, contentDescription = "More", tint = Color.LightGray)
+                }
+                DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                    if (!item.isFolder) {
+                        DropdownMenuItem(
+                            text = { Text("Stream in VLC / Player") },
+                            leadingIcon = { Icon(Icons.Default.OpenInNew, contentDescription = null) },
+                            onClick = {
+                                showMenu = false
+                                onExternalOpen()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (isPinned) "Already Pinned" else "Pin for Offline") },
+                            leadingIcon = { Icon(Icons.Default.PushPin, contentDescription = null) },
+                            onClick = {
+                                showMenu = false
+                                onPinClick()
+                            }
+                        )
+                    }
+                }
+            }
+        }
     }
 
-    private fun isImageFile(name: String): Boolean {
-        val lower = name.lowercase()
-        return lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") ||
-                lower.endsWith(".webp") || lower.endsWith(".gif")
+    @Composable
+    fun MediaGridCard(
+        item: FileEntity,
+        onClick: () -> Unit
+    ) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(0.9f)
+                .clickable { onClick() }
+        ) {
+            Column(
+                modifier = Modifier.padding(8.dp).fillMaxSize(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    imageVector = when {
+                        item.isFolder -> Icons.Default.Folder
+                        item.isVideo -> Icons.Default.Videocam
+                        item.isAudio -> Icons.Default.MusicNote
+                        item.isImage -> Icons.Default.Image
+                        else -> Icons.Default.InsertDriveFile
+                    },
+                    contentDescription = null,
+                    tint = when {
+                        item.isFolder -> Color(0xFFFFB74D)
+                        item.isVideo -> Color(0xFF42A5F5)
+                        item.isAudio -> Color(0xFF66BB6A)
+                        else -> Color(0xFFAB47BC)
+                    },
+                    modifier = Modifier.size(36.dp)
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = item.name,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Color.White,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+    }
+
+    @Composable
+    fun ImageViewerDialog(
+        file: FileEntity,
+        accessToken: String,
+        onDismiss: () -> Unit
+    ) {
+        Dialog(
+            onDismissRequest = onDismiss,
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center
+            ) {
+                val streamUrl = GoogleDriveApiClient.BASE_URL + "/files/${file.id}?alt=media"
+                AsyncImage(
+                    model = streamUrl,
+                    contentDescription = file.name,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(16.dp)
+                        .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                ) {
+                    Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White)
+                }
+            }
+        }
+    }
+
+    @Composable
+    fun LoginDialog(
+        onDismiss: () -> Unit,
+        onConnected: (DriveAccount) -> Unit
+    ) {
+        var tokenInput by remember { mutableStateOf("") }
+        var isConnecting by remember { mutableStateOf(false) }
+        val scope = rememberCoroutineScope()
+
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("Connect Google Drive", fontWeight = FontWeight.Bold) },
+            text = {
+                Column {
+                    Text(
+                        "Enter your Google OAuth2 Access Token (scope: drive.readonly) to connect your Google Drive extra storage:",
+                        fontSize = 13.sp,
+                        color = Color.LightGray
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = tokenInput,
+                        onValueChange = { tokenInput = it },
+                        placeholder = { Text("Paste Bearer ya29....") },
+                        modifier = Modifier.fillMaxWidth(),
+                        maxLines = 3
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = tokenInput.isNotBlank() && !isConnecting,
+                    onClick = {
+                        val clean = tokenInput.trim().removePrefix("Bearer ").trim()
+                        isConnecting = true
+                        scope.launch {
+                            val res = withContext(Dispatchers.IO) { app.apiClient.getAbout(clean) }
+                            isConnecting = false
+                            if (res.isSuccess) {
+                                val (quota, user) = res.getOrNull()!!
+                                val acc = DriveAccount(
+                                    accountId = "drive_primary",
+                                    email = user?.emailAddress ?: "user@gmail.com",
+                                    displayName = user?.displayName ?: "Google Drive",
+                                    accessToken = clean,
+                                    refreshToken = null,
+                                    totalQuota = quota.limit,
+                                    usedQuota = quota.usage,
+                                    isActive = true
+                                )
+                                app.dbHelper.saveAccount(acc)
+                                onConnected(acc)
+                            } else {
+                                Toast.makeText(this@MainActivity, "Invalid Token: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
+                ) {
+                    Text(if (isConnecting) "Verifying..." else "Connect Drive")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) { Text("Cancel") }
+            }
+        )
+    }
+
+    private fun isNetworkAvailable(context: Context): Boolean {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val network = cm.activeNetwork ?: return false
+        val capabilities = cm.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
     private fun formatSize(bytes: Long): String {
         if (bytes <= 0) return "0 B"
-        val kb = bytes / 1024.0
-        val mb = kb / 1024.0
-        val gb = mb / 1024.0
-        return when {
-            gb >= 1.0 -> String.format("%.2f GB", gb)
-            mb >= 1.0 -> String.format("%.2f MB", mb)
-            kb >= 1.0 -> String.format("%.1f KB", kb)
-            else -> "$bytes B"
-        }
+        val units = arrayOf("B", "KB", "MB", "GB", "TB")
+        val digitGroups = (Math.log10(bytes.toDouble()) / Math.log10(1024.0)).toInt()
+        return String.format(Locale.US, "%.1f %s", bytes / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
     }
 
-    private fun formatDate(timestampSeconds: Long): String {
-        if (timestampSeconds <= 0) return ""
-        val sdf = SimpleDateFormat("MMM dd, yyyy", Locale.getDefault())
-        return sdf.format(Date(timestampSeconds * 1000L))
+    private fun formatGb(bytes: Long): String {
+        val gb = bytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
+        return String.format(Locale.US, "%.0f GB", gb)
     }
 
-    private fun getMimeType(name: String): String {
-        val ext = name.substringAfterLast('.', "").lowercase()
-        return when (ext) {
-            "mp4", "mkv", "avi", "mov", "webm" -> "video/*"
-            "mp3", "flac", "wav", "aac", "ogg" -> "audio/*"
-            "jpg", "jpeg", "png", "webp", "gif" -> "image/*"
-            "iso", "bin", "cso", "zip", "7z", "rar" -> "application/octet-stream"
-            "pdf" -> "application/pdf"
-            else -> "*/*"
-        }
-    }
-
-    private fun getFileInfoFromUri(context: Context, uri: Uri): Pair<String, Long> {
-        var name = "uploaded_file"
-        var size = 0L
-        try {
-            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-                if (cursor.moveToFirst()) {
-                    if (nameIndex != -1) name = cursor.getString(nameIndex) ?: name
-                    if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
-                }
-            }
-        } catch (e: Exception) {
-            // Fallback
-        }
-        return Pair(name, size)
+    private fun formatTime(millis: Long): String {
+        val totalSec = millis / 1000
+        val m = totalSec / 60
+        val s = totalSec % 60
+        return String.format(Locale.US, "%02d:%02d", m, s)
     }
 }

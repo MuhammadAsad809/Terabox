@@ -72,10 +72,17 @@ dependencies {
     // AndroidX Security for Keystore-backed Encrypted SharedPreferences
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
-    // Media3 (ExoPlayer) for in-app media preview and streaming test
+    // Media3 (ExoPlayer) for in-app media preview, streaming, and smart cache
     val media3Version = "1.3.1"
     implementation("androidx.media3:media3-exoplayer:$media3Version")
     implementation("androidx.media3:media3-ui:$media3Version")
+    implementation("androidx.media3:media3-datasource:$media3Version")
+    implementation("androidx.media3:media3-session:$media3Version")
+    implementation("androidx.media3:media3-database:$media3Version")
+
+    // Credentials & Google Sign-In
+    implementation("androidx.credentials:credentials:1.2.2")
+    implementation("androidx.credentials:credentials-play-services-auth:1.2.2")
 
     // Coil for thumbnails & image previews
     implementation("io.coil-kt:coil-compose:2.6.0")

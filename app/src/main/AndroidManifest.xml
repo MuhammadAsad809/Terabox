@@ -5,7 +5,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
@@ -19,7 +19,7 @@
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:usesCleartextTraffic="true">
 
-        <!-- Companion App Activity (Jetpack Compose) -->
+        <!-- Main Companion Activity (Jetpack Compose Material 3) -->
         <activity
             android:name=".ui.MainActivity"
             android:exported="true"
@@ -31,9 +31,19 @@
             </intent-filter>
         </activity>
 
-        <!-- Native Storage Access Framework DocumentsProvider -->
+        <!-- Media3 Background Media Session Service -->
+        <service
+            android:name=".player.CloudSSDMediaSessionService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
+
+        <!-- Storage Access Framework DocumentsProvider for Google Drive -->
         <provider
-            android:name=".provider.TeraBoxDocumentsProvider"
+            android:name=".provider.CloudSSDDocumentsProvider"
             android:authorities="com.terabox.vfs.documents"
             android:exported="true"
             android:grantUriPermissions="true"

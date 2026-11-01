@@ -1,4 +1,4 @@
-name: Build TeraBox Virtual Cloud Storage APK
+name: Build CloudSSD Media Android APK
 
 on:
   push:
@@ -46,7 +46,7 @@ jobs:
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: terabox-vfs-debug-apk
+          name: cloudssd-media-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 14
           if-no-files-found: error
