@@ -13,16 +13,19 @@ import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheWriter
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import com.terabox.vfs.data.CloudSSDDatabaseHelper
 import com.terabox.vfs.data.FileEntity
 import com.terabox.vfs.data.GoogleDriveApiClient
 import kotlinx.coroutines.*
+import okhttp3.OkHttpClient
 
 @OptIn(UnstableApi::class)
 class RuleBasedPrefetchEngine(
     private val context: Context,
     private val cacheManager: CloudSSDCacheManager,
-    private val dbHelper: CloudSSDDatabaseHelper
+    private val dbHelper: CloudSSDDatabaseHelper,
+    private val httpClient: OkHttpClient
 ) {
     companion object {
         const val PREFETCH_SIZE_BYTES = 15L * 1024L * 1024L // First 15 MB
@@ -70,10 +73,8 @@ class RuleBasedPrefetchEngine(
                 val cacheKey = cacheManager.buildCacheKey(nextFile.id, nextFile.md5Checksum)
                 val prefetchLength = if (nextFile.size in 1..PREFETCH_SIZE_BYTES) nextFile.size else PREFETCH_SIZE_BYTES
 
-                val httpDataSourceFactory = DefaultHttpDataSource.Factory()
+                val httpDataSourceFactory = OkHttpDataSource.Factory(httpClient)
                     .setUserAgent(GoogleDriveApiClient.USER_AGENT)
-                    .setConnectTimeoutMs(15000)
-                    .setReadTimeoutMs(30000)
                     .setDefaultRequestProperties(mapOf("Authorization" to "Bearer $accessToken"))
 
                 val cacheDataSource = CacheDataSource.Factory()

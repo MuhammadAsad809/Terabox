@@ -40,11 +40,11 @@ class TeraBoxApp : Application() {
         super.onCreate()
         instance = this
 
+        apiClient = GoogleDriveApiClient()
         dbHelper = CloudSSDDatabaseHelper(this)
         cacheManager = CloudSSDCacheManager(this, dbHelper)
-        prefetchEngine = RuleBasedPrefetchEngine(this, cacheManager, dbHelper)
-        playerManager = CloudSSDPlayerManager(this, cacheManager, dbHelper, prefetchEngine)
-        apiClient = GoogleDriveApiClient()
+        prefetchEngine = RuleBasedPrefetchEngine(this, cacheManager, dbHelper, apiClient.httpClient)
+        playerManager = CloudSSDPlayerManager(this, cacheManager, dbHelper, prefetchEngine, apiClient.httpClient)
 
         createNotificationChannels()
     }

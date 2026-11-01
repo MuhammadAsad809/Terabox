@@ -66,8 +66,13 @@ data class OAuthTokenResponse(
 )
 
 class GoogleDriveApiClient(
-    private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
+    val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectionPool(ConnectionPool(16, 5, TimeUnit.MINUTES))
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .retryOnConnectionFailure(true)
+        .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .build()

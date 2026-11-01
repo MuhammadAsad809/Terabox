@@ -865,15 +865,17 @@ class MainActivity : ComponentActivity() {
         var isPlaying by remember { mutableStateOf(player.isPlaying) }
         var currentPosition by remember { mutableLongStateOf(player.currentPosition) }
         var duration by remember { mutableLongStateOf(player.duration.coerceAtLeast(0L)) }
+        var playbackState by remember { mutableIntStateOf(player.playbackState) }
         var selectedSpeed by remember { mutableFloatStateOf(1.0f) }
 
         // Periodic ticker for seek bar
         LaunchedEffect(Unit) {
             while (true) {
                 isPlaying = player.isPlaying
+                playbackState = player.playbackState
                 currentPosition = player.currentPosition.coerceAtLeast(0L)
                 duration = player.duration.coerceAtLeast(0L)
-                delay(500)
+                delay(400)
             }
         }
 
@@ -928,6 +930,22 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.height(16.dp))
                         Text(activeFile.name, fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color.White, maxLines = 1)
                         Text("Google Drive Cloud Audio", fontSize = 12.sp, color = Color.Gray)
+                    }
+                }
+
+                // Instant visual feedback when buffering initial stream chunks
+                if (playbackState == Player.STATE_BUFFERING) {
+                    Box(
+                        modifier = Modifier
+                            .size(72.dp)
+                            .background(Color.Black.copy(alpha = 0.6f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator(
+                            color = Color(0xFF42A5F5),
+                            strokeWidth = 3.dp,
+                            modifier = Modifier.size(42.dp)
+                        )
                     }
                 }
             }
