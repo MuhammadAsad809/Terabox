@@ -1,5 +1,6 @@
 package com.terabox.vfs.ui
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
@@ -9,7 +10,17 @@ import android.os.Bundle
 import android.provider.DocumentsContract
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import com.google.android.gms.auth.GoogleAuthUtil
+import com.google.android.gms.auth.UserRecoverableAuthException
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInAccount
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.common.api.Scope
+import com.terabox.vfs.data.DriveQuota
 import kotlin.OptIn
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
@@ -115,6 +126,10 @@ class MainActivity : ComponentActivity() {
         // Pinning Progress
         var pinningProgress by remember { mutableStateOf<Pair<String, Float>?>(null) }
 
+        // Google Sign-In Permission & Account State
+        var pendingAccountForAuth by remember { mutableStateOf<android.accounts.Account?>(null) }
+        var pendingGoogleAccount by remember { mutableStateOf<GoogleSignInAccount?>(null) }
+
         // Function to load children from DB and sync with Google Drive
         fun refreshDirectory(folderId: String, forceCloud: Boolean = false) {
             val acc = activeAccount
@@ -192,6 +207,144 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 isLoading = false
+            }
+        }
+
+        val recoverableAuthLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            val accObj = pendingAccountForAuth
+            val gAcc = pendingGoogleAccount
+            if (result.resultCode == Activity.RESULT_OK && accObj != null && gAcc != null) {
+                scope.launch {
+                    isLoading = true
+                    val tokenResult = withContext(Dispatchers.IO) {
+                        try {
+                            val token = GoogleAuthUtil.getToken(
+                                this@MainActivity,
+                                accObj,
+                                "oauth2:https://www.googleapis.com/auth/drive.readonly"
+                            )
+                            Result.success(token)
+                        } catch (e: Exception) {
+                            Result.failure(e)
+                        }
+                    }
+
+                    val token = tokenResult.getOrNull()
+                    if (token != null) {
+                        val aboutRes = withContext(Dispatchers.IO) { app.apiClient.getAbout(token) }
+                        val (quota, user) = aboutRes.getOrNull() ?: Pair(DriveQuota(15L * 1024L * 1024L * 1024L, 0L, 0L), null)
+                        val acc = DriveAccount(
+                            accountId = gAcc.id ?: "drive_primary",
+                            email = gAcc.email ?: (user?.emailAddress ?: ""),
+                            displayName = gAcc.displayName ?: (user?.displayName ?: "Google User"),
+                            accessToken = token,
+                            refreshToken = null,
+                            totalQuota = quota.limit,
+                            usedQuota = quota.usage,
+                            isActive = true
+                        )
+                        app.dbHelper.saveAccount(acc)
+                        activeAccount = acc
+                        showLoginDialog = false
+                        refreshDirectory("root", forceCloud = true)
+                        Toast.makeText(this@MainActivity, "Signed in as ${acc.displayName}!", Toast.LENGTH_LONG).show()
+                    } else {
+                        Toast.makeText(this@MainActivity, "Sign-in error: ${tokenResult.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                        showLoginDialog = true
+                    }
+                    isLoading = false
+                }
+            } else {
+                Toast.makeText(this@MainActivity, "Drive permission was not granted", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        val googleSignInLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
+            try {
+                val googleAccount = task.getResult(ApiException::class.java)
+                val accountObj = googleAccount?.account
+                if (accountObj != null) {
+                    scope.launch {
+                        isLoading = true
+                        val tokenResult = withContext(Dispatchers.IO) {
+                            try {
+                                val token = GoogleAuthUtil.getToken(
+                                    this@MainActivity,
+                                    accountObj,
+                                    "oauth2:https://www.googleapis.com/auth/drive.readonly"
+                                )
+                                Result.success(token)
+                            } catch (e: UserRecoverableAuthException) {
+                                Result.failure(e)
+                            } catch (e: Exception) {
+                                Result.failure(e)
+                            }
+                        }
+
+                        val token = tokenResult.getOrNull()
+                        if (token != null) {
+                            val aboutRes = withContext(Dispatchers.IO) { app.apiClient.getAbout(token) }
+                            val (quota, user) = aboutRes.getOrNull() ?: Pair(DriveQuota(15L * 1024L * 1024L * 1024L, 0L, 0L), null)
+                            val acc = DriveAccount(
+                                accountId = googleAccount.id ?: "drive_primary",
+                                email = googleAccount.email ?: (user?.emailAddress ?: ""),
+                                displayName = googleAccount.displayName ?: (user?.displayName ?: "Google User"),
+                                accessToken = token,
+                                refreshToken = null,
+                                totalQuota = quota.limit,
+                                usedQuota = quota.usage,
+                                isActive = true
+                            )
+                            app.dbHelper.saveAccount(acc)
+                            activeAccount = acc
+                            showLoginDialog = false
+                            refreshDirectory("root", forceCloud = true)
+                            Toast.makeText(this@MainActivity, "Signed in as ${acc.displayName}!", Toast.LENGTH_LONG).show()
+                        } else {
+                            val ex = tokenResult.exceptionOrNull()
+                            if (ex is UserRecoverableAuthException) {
+                                pendingAccountForAuth = accountObj
+                                pendingGoogleAccount = googleAccount
+                                recoverableAuthLauncher.launch(ex.intent)
+                            } else {
+                                Toast.makeText(this@MainActivity, "Google Sign-In: ${ex?.message ?: "Failed"}", Toast.LENGTH_LONG).show()
+                                showLoginDialog = true
+                            }
+                        }
+                        isLoading = false
+                    }
+                } else {
+                    Toast.makeText(this@MainActivity, "No Google account selected", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: ApiException) {
+                if (e.statusCode == 12501) {
+                    Toast.makeText(this@MainActivity, "Sign-in cancelled", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this@MainActivity, "Google Sign-In (${e.statusCode}): Please use manual token below", Toast.LENGTH_LONG).show()
+                    showLoginDialog = true
+                }
+            }
+        }
+
+        fun launchGoogleSignIn() {
+            try {
+                val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+                    .requestEmail()
+                    .requestProfile()
+                    .requestScopes(Scope("https://www.googleapis.com/auth/drive.readonly"))
+                    .build()
+                val googleSignInClient = GoogleSignIn.getClient(this@MainActivity, gso)
+                googleSignInClient.signOut().addOnCompleteListener {
+                    googleSignInLauncher.launch(googleSignInClient.signInIntent)
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this@MainActivity, "Cannot start Google Sign-In: ${e.message}", Toast.LENGTH_SHORT).show()
+                showLoginDialog = true
             }
         }
 
@@ -394,7 +547,8 @@ class MainActivity : ComponentActivity() {
                                     Toast.makeText(this@MainActivity, "Cannot open: ${e.message}", Toast.LENGTH_SHORT).show()
                                 }
                             },
-                            onSignInClick = { showLoginDialog = true }
+                            onSignInClick = { launchGoogleSignIn() },
+                            onManualSignInClick = { showLoginDialog = true }
                         )
                         1 -> PlayerTab(
                             activeFile = activePlayingFile,
@@ -469,6 +623,7 @@ class MainActivity : ComponentActivity() {
                 if (showLoginDialog) {
                     LoginDialog(
                         onDismiss = { showLoginDialog = false },
+                        onGoogleSignInClick = { launchGoogleSignIn() },
                         onConnected = { acc ->
                             activeAccount = acc
                             showLoginDialog = false
@@ -502,7 +657,8 @@ class MainActivity : ComponentActivity() {
         onFileClick: (FileEntity) -> Unit,
         onPinClick: (FileEntity) -> Unit,
         onExternalOpen: (FileEntity) -> Unit,
-        onSignInClick: () -> Unit
+        onSignInClick: () -> Unit,
+        onManualSignInClick: () -> Unit
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             if (account == null) {
@@ -525,12 +681,22 @@ class MainActivity : ComponentActivity() {
                             Spacer(Modifier.height(20.dp))
                             Button(
                                 onClick = onSignInClick,
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E88E5)),
-                                modifier = Modifier.fillMaxWidth()
+                                colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color(0xFF1F1F1F)),
+                                shape = RoundedCornerShape(24.dp),
+                                modifier = Modifier.fillMaxWidth().height(48.dp)
                             ) {
-                                Icon(Icons.Default.Key, contentDescription = null)
-                                Spacer(Modifier.width(8.dp))
-                                Text("Connect Drive Account")
+                                Icon(
+                                    imageVector = Icons.Default.AccountCircle,
+                                    contentDescription = null,
+                                    tint = Color(0xFF4285F4),
+                                    modifier = Modifier.size(24.dp)
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Text("Sign in with Google", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            TextButton(onClick = onManualSignInClick) {
+                                Text("Manual Token Input / Advanced", fontSize = 12.sp, color = Color(0xFF81D4FA))
                             }
                         }
                     }
@@ -1316,87 +1482,180 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun LoginDialog(
         onDismiss: () -> Unit,
+        onGoogleSignInClick: () -> Unit,
         onConnected: (DriveAccount) -> Unit
     ) {
         var tokenInput by remember { mutableStateOf("") }
         var isConnecting by remember { mutableStateOf(false) }
+        var showManualInput by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
 
         AlertDialog(
             onDismissRequest = onDismiss,
-            title = { Text("Connect Google Drive", fontWeight = FontWeight.Bold) },
-            text = {
-                Column {
-                    Text(
-                        "Google Drive connect karne ke liye apna Access Token (ya29....) yahan paste karein:",
-                        fontSize = 13.sp,
-                        color = Color.LightGray
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.CloudQueue,
+                        contentDescription = null,
+                        tint = Color(0xFF42A5F5),
+                        modifier = Modifier.size(28.dp)
                     )
-                    Spacer(Modifier.height(10.dp))
-                    OutlinedButton(
-                        onClick = {
-                            val url = "https://developers.google.com/oauthplayground/#step1&scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly"
-                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                            startActivity(intent)
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF42A5F5))
-                    ) {
-                        Icon(Icons.Default.OpenInBrowser, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text("1-Tap: Get Token in Browser", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                    }
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        "Tariqa:\n1. Upar 'Get Token' button dabayein\n2. 'Authorize APIs' par tap karke apna Google Account select karein\n3. 'Exchange authorization code' dabayein aur Access Token copy karein",
-                        fontSize = 11.sp,
-                        color = Color.Gray,
-                        lineHeight = 16.sp
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    OutlinedTextField(
-                        value = tokenInput,
-                        onValueChange = { tokenInput = it },
-                        placeholder = { Text("Paste ya29.... yahan", fontSize = 12.sp) },
-                        modifier = Modifier.fillMaxWidth(),
-                        maxLines = 3
-                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text("Connect Google Drive", fontWeight = FontWeight.Bold, fontSize = 18.sp)
                 }
             },
-            confirmButton = {
-                Button(
-                    enabled = tokenInput.isNotBlank() && !isConnecting,
-                    onClick = {
-                        val clean = tokenInput.trim().removePrefix("Bearer ").trim()
-                        isConnecting = true
-                        scope.launch {
-                            val res = withContext(Dispatchers.IO) { app.apiClient.getAbout(clean) }
-                            isConnecting = false
-                            if (res.isSuccess) {
-                                val (quota, user) = res.getOrNull()!!
-                                val acc = DriveAccount(
-                                    accountId = "drive_primary",
-                                    email = user?.emailAddress ?: "user@gmail.com",
-                                    displayName = user?.displayName ?: "Google Drive",
-                                    accessToken = clean,
-                                    refreshToken = null,
-                                    totalQuota = quota.limit,
-                                    usedQuota = quota.usage,
-                                    isActive = true
-                                )
-                                app.dbHelper.saveAccount(acc)
-                                onConnected(acc)
-                            } else {
-                                Toast.makeText(this@MainActivity, "Invalid Token: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        "Apna Google Drive account connect karein taake videos, audios aur images direct cloud se stream ho sakein bina phone memory bhare:",
+                        fontSize = 13.sp,
+                        color = Color.LightGray,
+                        lineHeight = 18.sp
+                    )
+
+                    Spacer(Modifier.height(16.dp))
+
+                    // 1-Tap Google Sign-In Button (Primary)
+                    Button(
+                        onClick = {
+                            onDismiss()
+                            onGoogleSignInClick()
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color.White,
+                            contentColor = Color(0xFF1F1F1F)
+                        ),
+                        shape = RoundedCornerShape(24.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AccountCircle,
+                            contentDescription = null,
+                            tint = Color(0xFF4285F4),
+                            modifier = Modifier.size(26.dp)
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Text(
+                            "Sign in with Google",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp,
+                            color = Color(0xFF202124)
+                        )
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+
+                    // Expandable Manual / Browser Token Option
+                    Surface(
+                        color = Color(0xFF262626),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showManualInput = !showManualInput }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (showManualInput) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                contentDescription = null,
+                                tint = Color(0xFF81D4FA),
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "Or enter Access Token manually",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = Color(0xFF81D4FA)
+                            )
+                        }
+                    }
+
+                    if (showManualInput) {
+                        Spacer(Modifier.height(12.dp))
+                        Text(
+                            "Agar Google Sign-In na chalay, to browser se direct token hasil karein:",
+                            fontSize = 12.sp,
+                            color = Color.Gray
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                val url = "https://developers.google.com/oauthplayground/#step1&scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly"
+                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                startActivity(intent)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF42A5F5))
+                        ) {
+                            Icon(Icons.Default.OpenInBrowser, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("1-Tap: Get Token in Browser", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Tariqa:\n1. 'Get Token' button dabayein\n2. 'Authorize APIs' par Google account choose karein\n3. 'Exchange authorization code' karke Access Token paste karein",
+                            fontSize = 11.sp,
+                            color = Color.Gray,
+                            lineHeight = 15.sp
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedTextField(
+                            value = tokenInput,
+                            onValueChange = { tokenInput = it },
+                            placeholder = { Text("Paste ya29.... token yahan", fontSize = 12.sp) },
+                            modifier = Modifier.fillMaxWidth(),
+                            maxLines = 3
+                        )
+                        if (tokenInput.isNotBlank()) {
+                            Spacer(Modifier.height(10.dp))
+                            Button(
+                                enabled = !isConnecting,
+                                onClick = {
+                                    val clean = tokenInput.trim().removePrefix("Bearer ").trim()
+                                    isConnecting = true
+                                    scope.launch {
+                                        val res = withContext(Dispatchers.IO) { app.apiClient.getAbout(clean) }
+                                        isConnecting = false
+                                        if (res.isSuccess) {
+                                            val (quota, user) = res.getOrNull()!!
+                                            val acc = DriveAccount(
+                                                accountId = "drive_primary",
+                                                email = user?.emailAddress ?: "user@gmail.com",
+                                                displayName = user?.displayName ?: "Google Drive",
+                                                accessToken = clean,
+                                                refreshToken = null,
+                                                totalQuota = quota.limit,
+                                                usedQuota = quota.usage,
+                                                isActive = true
+                                            )
+                                            app.dbHelper.saveAccount(acc)
+                                            onConnected(acc)
+                                        } else {
+                                            Toast.makeText(this@MainActivity, "Invalid Token: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E88E5))
+                            ) {
+                                Text(if (isConnecting) "Verifying..." else "Connect with Token")
                             }
                         }
                     }
-                ) {
-                    Text(if (isConnecting) "Verifying..." else "Connect Drive")
                 }
             },
+            confirmButton = {},
             dismissButton = {
-                TextButton(onClick = onDismiss) { Text("Cancel") }
+                TextButton(onClick = onDismiss) { Text("Cancel", color = Color.Gray) }
             }
         )
     }

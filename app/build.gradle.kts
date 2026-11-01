@@ -87,6 +87,7 @@ dependencies {
     // Credentials & Google Sign-In
     implementation("androidx.credentials:credentials:1.2.2")
     implementation("androidx.credentials:credentials-play-services-auth:1.2.2")
+    implementation("com.google.android.gms:play-services-auth:21.2.0")
 
     // Coil for thumbnails & image previews
     implementation("io.coil-kt:coil-compose:2.6.0")
