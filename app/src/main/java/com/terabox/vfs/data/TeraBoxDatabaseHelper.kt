@@ -39,6 +39,12 @@ class TeraBoxDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABA
         const val TABLE_NODES = "nodes"
         const val TABLE_CACHE_BLOCKS = "cache_blocks"
         const val TABLE_UPLOADS = "upload_tasks"
+
+        fun normalizeParentPath(path: String): String {
+            if (path == "/" || path.isBlank()) return "/"
+            val trimmed = if (path.endsWith("/")) path.dropLast(1) else path
+            return if (trimmed.startsWith("/")) trimmed else "/$trimmed"
+        }
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -71,6 +77,7 @@ class TeraBoxDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABA
 
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_parent ON $TABLE_NODES (account_id, parent_path)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_filename ON $TABLE_NODES (account_id, filename)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_path ON $TABLE_NODES (account_id, path)")
 
         db.execSQL("""
             CREATE TABLE IF NOT EXISTS $TABLE_CACHE_BLOCKS (
@@ -157,16 +164,25 @@ class TeraBoxDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABA
         return null
     }
 
+    fun setAccountActive(id: String, active: Boolean) {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            put("active", if (active) 1 else 0)
+        }
+        db.update(TABLE_ACCOUNTS, values, "id = ?", arrayOf(id))
+    }
+
     fun insertOrUpdateNodes(nodes: List<FileNodeModel>) {
         val db = writableDatabase
         db.beginTransaction()
         try {
             for (node in nodes) {
+                val normalizedParent = normalizeParentPath(node.parentPath)
                 val values = ContentValues().apply {
                     put("fs_id", node.fsId)
                     put("account_id", node.accountId)
                     put("path", node.path)
-                    put("parent_path", node.parentPath)
+                    put("parent_path", normalizedParent)
                     put("filename", node.filename)
                     put("is_dir", if (node.isDir) 1 else 0)
                     put("size", node.size)
@@ -185,6 +201,12 @@ class TeraBoxDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABA
         }
     }
 
+    fun deleteNodesForParent(accountId: String, parentPath: String) {
+        val db = writableDatabase
+        val normalized = normalizeParentPath(parentPath)
+        db.delete(TABLE_NODES, "account_id = ? AND parent_path = ?", arrayOf(accountId, normalized))
+    }
+
     fun getNode(fsId: Long): FileNodeModel? {
         val db = readableDatabase
         val cursor = db.query(TABLE_NODES, null, "fs_id = ?", arrayOf(fsId.toString()), null, null, null)
@@ -196,14 +218,26 @@ class TeraBoxDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABA
         return null
     }
 
+    fun getNodeByPath(accountId: String, path: String): FileNodeModel? {
+        val db = readableDatabase
+        val cursor = db.query(TABLE_NODES, null, "account_id = ? AND path = ?", arrayOf(accountId, path), null, null, null)
+        cursor.use {
+            if (it.moveToFirst()) {
+                return extractNode(it)
+            }
+        }
+        return null
+    }
+
     fun getChildren(accountId: String, parentPath: String): List<FileNodeModel> {
         val list = mutableListOf<FileNodeModel>()
         val db = readableDatabase
+        val normalized = normalizeParentPath(parentPath)
         val cursor = db.query(
             TABLE_NODES,
             null,
             "account_id = ? AND parent_path = ?",
-            arrayOf(accountId, parentPath),
+            arrayOf(accountId, normalized),
             null,
             null,
             "is_dir DESC, filename ASC"

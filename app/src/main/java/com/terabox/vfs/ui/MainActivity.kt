@@ -192,9 +192,10 @@ class MainActivity : ComponentActivity() {
                         val client = TeraBoxApiClient()
                         val quotaRes = withContext(Dispatchers.IO) { client.getQuota(ndusCookie) }
                         val quota = quotaRes.getOrNull()
+                        val accNum = accounts.size + 1
                         val acc = AccountModel(
-                            id = "terabox_1",
-                            name = "My TeraBox",
+                            id = "acc_${System.currentTimeMillis()}",
+                            name = "TeraBox Account $accNum",
                             ndus = ndusCookie,
                             totalQuota = quota?.total ?: (1024L * 1024L * 1024L * 1024L),
                             usedQuota = quota?.used ?: 0L,
@@ -220,9 +221,10 @@ class MainActivity : ComponentActivity() {
                         val client = TeraBoxApiClient()
                         val quotaRes = withContext(Dispatchers.IO) { client.getQuota(cookie) }
                         val quota = quotaRes.getOrNull()
+                        val accNum = accounts.size + 1
                         val acc = AccountModel(
-                            id = "terabox_1",
-                            name = "My TeraBox",
+                            id = "acc_${System.currentTimeMillis()}",
+                            name = "TeraBox Account $accNum",
                             ndus = cookie,
                             totalQuota = quota?.total ?: (1024L * 1024L * 1024L * 1024L),
                             usedQuota = quota?.used ?: 0L,
@@ -303,6 +305,24 @@ class MainActivity : ComponentActivity() {
                             fontSize = 12.sp,
                             color = Color.White
                         )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onLoginClick,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Add Account (WebView)", fontSize = 12.sp)
+                    }
+                    OutlinedButton(
+                        onClick = onManualCookieClick,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Add (Cookie)", fontSize = 12.sp)
                     }
                 }
             } else {

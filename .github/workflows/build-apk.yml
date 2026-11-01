@@ -35,6 +35,10 @@ jobs:
         run: |
           if [ -f gradlew ]; then chmod +x gradlew; fi
 
+      - name: Run Unit Tests
+        run: |
+          gradle test --stacktrace
+
       - name: Build Debug APK with Gradle
         run: |
           gradle assembleDebug --stacktrace

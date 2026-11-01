@@ -11,13 +11,15 @@ import android.os.ParcelFileDescriptor
 import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
+import android.util.Log
 import android.webkit.MimeTypeMap
 import com.terabox.vfs.R
 import com.terabox.vfs.TeraBoxApp
 import com.terabox.vfs.data.AccountModel
 import com.terabox.vfs.data.FileNodeModel
 import com.terabox.vfs.data.TeraBoxApiClient
-import java.io.File
+import com.terabox.vfs.data.TeraBoxDatabaseHelper
+import com.terabox.vfs.data.TeraBoxSessionExpiredException
 import java.io.FileNotFoundException
 import java.io.IOException
 
@@ -25,11 +27,13 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
 
     companion object {
         const val AUTHORITY = "com.terabox.vfs.documents"
+        private const val TAG = "TeraBoxDocumentsProvider"
 
         private val DEFAULT_ROOT_PROJECTION = arrayOf(
             DocumentsContract.Root.COLUMN_ROOT_ID,
             DocumentsContract.Root.COLUMN_DOCUMENT_ID,
             DocumentsContract.Root.COLUMN_TITLE,
+            DocumentsContract.Root.COLUMN_SUMMARY,
             DocumentsContract.Root.COLUMN_FLAGS,
             DocumentsContract.Root.COLUMN_ICON,
             DocumentsContract.Root.COLUMN_AVAILABLE_BYTES,
@@ -45,6 +49,28 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
             DocumentsContract.Document.COLUMN_LAST_MODIFIED,
             DocumentsContract.Document.COLUMN_FLAGS
         )
+
+        fun buildDocId(accountId: String, fsId: Long): String = "doc:$accountId:$fsId"
+
+        fun parseDocId(documentId: String): Pair<String, Long> {
+            if (documentId.startsWith("doc:")) {
+                val parts = documentId.split(":")
+                if (parts.size >= 3) {
+                    val accountId = parts[1]
+                    val fsId = parts[2].toLongOrNull() ?: 0L
+                    return Pair(accountId, fsId)
+                }
+            }
+            // Fallback for legacy underscore-delimited format
+            val trimmed = documentId.removePrefix("doc_")
+            val lastUnderscore = trimmed.lastIndexOf('_')
+            if (lastUnderscore > 0) {
+                val accountId = trimmed.substring(0, lastUnderscore)
+                val fsId = trimmed.substring(lastUnderscore + 1).toLongOrNull() ?: 0L
+                return Pair(accountId, fsId)
+            }
+            return Pair("default", 0L)
+        }
     }
 
     private val apiClient = TeraBoxApiClient()
@@ -67,10 +93,10 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
             row.add(DocumentsContract.Root.COLUMN_ROOT_ID, "root_${account.id}")
             row.add(DocumentsContract.Root.COLUMN_DOCUMENT_ID, buildDocId(account.id, 0L))
             row.add(DocumentsContract.Root.COLUMN_TITLE, "TeraBox (${account.name})")
+            row.add(DocumentsContract.Root.COLUMN_SUMMARY, "Cloud Storage")
             row.add(
                 DocumentsContract.Root.COLUMN_FLAGS,
-                DocumentsContract.Root.FLAG_SUPPORTS_CREATE or
-                        DocumentsContract.Root.FLAG_SUPPORTS_SEARCH or
+                DocumentsContract.Root.FLAG_SUPPORTS_SEARCH or
                         DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD
             )
             row.add(DocumentsContract.Root.COLUMN_ICON, R.mipmap.ic_launcher)
@@ -78,6 +104,12 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
             row.add(DocumentsContract.Root.COLUMN_CAPACITY_BYTES, account.totalQuota)
             row.add(DocumentsContract.Root.COLUMN_MIME_TYPES, "*/*")
         }
+
+        // Inform Android system to watch for account changes
+        result.setNotificationUri(
+            context?.contentResolver,
+            DocumentsContract.buildRootsUri(AUTHORITY)
+        )
 
         return result
     }
@@ -88,13 +120,19 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
         val app = TeraBoxApp.instance
 
         if (fsId == 0L) {
-            // Root virtual folder
-            includeRootDocument(result, documentId)
+            val account = app.dbHelper.getAccount(accountId)
+            val displayName = if (account != null) "TeraBox (${account.name})" else "TeraBox Cloud Drive"
+            includeRootDocument(result, documentId, displayName)
         } else {
             val node = app.dbHelper.getNode(fsId)
                 ?: throw FileNotFoundException("Document not found: $documentId")
             includeFileDocument(result, node)
         }
+
+        result.setNotificationUri(
+            context?.contentResolver,
+            DocumentsContract.buildDocumentUri(AUTHORITY, documentId)
+        )
 
         return result
     }
@@ -107,6 +145,7 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         val (accountId, fsId) = parseDocId(parentDocumentId)
         val app = TeraBoxApp.instance
+        val account = app.dbHelper.getAccount(accountId)
 
         val parentPath = if (fsId == 0L) {
             "/"
@@ -115,10 +154,53 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
             parentNode?.path ?: "/"
         }
 
-        val children = app.dbHelper.getChildren(accountId, parentPath)
+        // 1. Check local indexed metadata
+        var children = app.dbHelper.getChildren(accountId, parentPath)
+
+        // 2. If local cache is empty and account is authenticated, fetch live from real TeraBox API
+        if (children.isEmpty() && account != null && account.active) {
+            try {
+                val listResult = apiClient.listFiles(account.ndus, parentPath)
+                if (listResult.isSuccess) {
+                    val items = listResult.getOrDefault(emptyList())
+                    val normalizedParent = TeraBoxDatabaseHelper.normalizeParentPath(parentPath)
+                    val newNodes = items.map { item ->
+                        FileNodeModel(
+                            fsId = item.fsId,
+                            accountId = account.id,
+                            path = item.path,
+                            parentPath = normalizedParent,
+                            filename = item.filename,
+                            isDir = item.isdir == 1,
+                            size = item.size,
+                            mtime = item.mtime,
+                            dlink = item.dlink,
+                            dlinkUpdatedAt = if (item.dlink != null) System.currentTimeMillis() else 0L,
+                            isPinned = false
+                        )
+                    }
+                    app.dbHelper.insertOrUpdateNodes(newNodes)
+                    children = app.dbHelper.getChildren(accountId, parentPath)
+                } else {
+                    val error = listResult.exceptionOrNull()
+                    if (error is TeraBoxSessionExpiredException) {
+                        Log.w(TAG, "TeraBox session expired for account $accountId")
+                        app.dbHelper.setAccountActive(accountId, false)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error fetching live children for $parentPath: ${e.message}")
+            }
+        }
+
         for (node in children) {
             includeFileDocument(result, node)
         }
+
+        result.setNotificationUri(
+            context?.contentResolver,
+            DocumentsContract.buildChildDocumentsUri(AUTHORITY, parentDocumentId)
+        )
 
         return result
     }
@@ -140,79 +222,89 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
         return result
     }
 
+    override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
+        val (parentAcc, parentFsId) = parseDocId(parentDocumentId)
+        val (childAcc, childFsId) = parseDocId(documentId)
+
+        if (parentAcc != childAcc) return false
+        if (parentDocumentId == documentId) return false
+
+        // Root directory contains all items belonging to this account
+        if (parentFsId == 0L) return true
+
+        val app = TeraBoxApp.instance
+        val parentNode = app.dbHelper.getNode(parentFsId) ?: return false
+        val childNode = app.dbHelper.getNode(childFsId) ?: return false
+
+        val parentPrefix = if (parentNode.path.endsWith("/")) parentNode.path else "${parentNode.path}/"
+        return childNode.path.startsWith(parentPrefix)
+    }
+
+    override fun getDocumentType(documentId: String): String {
+        val (_, fsId) = parseDocId(documentId)
+        if (fsId == 0L) {
+            return DocumentsContract.Document.MIME_TYPE_DIR
+        }
+        val app = TeraBoxApp.instance
+        val node = app.dbHelper.getNode(fsId)
+        return if (node?.isDir == true) {
+            DocumentsContract.Document.MIME_TYPE_DIR
+        } else {
+            getMimeTypeForName(node?.filename ?: "")
+        }
+    }
+
     override fun openDocument(
         documentId: String,
         mode: String,
         signal: CancellationSignal?
     ): ParcelFileDescriptor {
+        if (mode != "r" && mode != "rt") {
+            throw UnsupportedOperationException("Read-only access: writing to virtual cloud storage is not supported in this phase")
+        }
+
         val (accountId, fsId) = parseDocId(documentId)
         val app = TeraBoxApp.instance
         val account = app.dbHelper.getAccount(accountId)
             ?: throw FileNotFoundException("Account not found for: $documentId")
 
-        if (mode == "r" || mode == "rt") {
-            val node = app.dbHelper.getNode(fsId)
-                ?: throw FileNotFoundException("File not found: $documentId")
+        val node = app.dbHelper.getNode(fsId)
+            ?: throw FileNotFoundException("File not found: $documentId")
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val storageManager = context?.getSystemService(Context.STORAGE_SERVICE) as? StorageManager
-                    ?: throw IOException("StorageManager unavailable")
+        if (node.isDir) {
+            throw FileNotFoundException("Cannot open directory as a file: $documentId")
+        }
 
-                val callback = TeraBoxProxyCallback(
-                    account = account,
-                    node = node,
-                    apiClient = apiClient,
-                    dbHelper = app.dbHelper,
-                    cacheManager = app.cacheManager
-                )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val storageManager = context?.getSystemService(Context.STORAGE_SERVICE) as? StorageManager
+                ?: throw IOException("StorageManager unavailable on this device")
 
-                return storageManager.openProxyFileDescriptor(
-                    ParcelFileDescriptor.MODE_READ_ONLY,
-                    callback,
-                    handler
-                )
-            } else {
-                throw IOException("Virtual Cloud Storage requires Android 8.0+ (API 26)")
-            }
-        } else {
-            // Staged write mode
-            val stagingDir = File(context?.cacheDir, "staged_uploads").apply { mkdirs() }
-            val stagedFile = File(stagingDir, "stage_${fsId}_${System.currentTimeMillis()}.tmp")
-            return ParcelFileDescriptor.open(
-                stagedFile,
-                ParcelFileDescriptor.MODE_READ_WRITE or ParcelFileDescriptor.MODE_CREATE
+            val callback = TeraBoxProxyCallback(
+                account = account,
+                node = node,
+                apiClient = apiClient,
+                dbHelper = app.dbHelper,
+                cacheManager = app.cacheManager
             )
+
+            return storageManager.openProxyFileDescriptor(
+                ParcelFileDescriptor.MODE_READ_ONLY,
+                callback,
+                handler
+            )
+        } else {
+            throw IOException("Virtual Cloud Storage requires Android 8.0+ (API 26)")
         }
     }
 
-    override fun createDocument(
-        parentDocumentId: String,
-        mimeType: String,
-        displayName: String
-    ): String {
-        val (accountId, _) = parseDocId(parentDocumentId)
-        val tempFsId = System.currentTimeMillis()
-        return buildDocId(accountId, tempFsId)
-    }
-
-    override fun deleteDocument(documentId: String) {
-        val (_, fsId) = parseDocId(documentId)
-        val app = TeraBoxApp.instance
-        val node = app.dbHelper.getNode(fsId) ?: return
-        // Staged for deletion
-    }
-
-    private fun includeRootDocument(result: MatrixCursor, docId: String) {
+    private fun includeRootDocument(result: MatrixCursor, docId: String, title: String) {
         val row = result.newRow()
         row.add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, docId)
-        row.add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, "TeraBox Virtual Drive")
+        row.add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, title)
         row.add(DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.MIME_TYPE_DIR)
         row.add(DocumentsContract.Document.COLUMN_SIZE, 0L)
         row.add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, System.currentTimeMillis())
-        row.add(
-            DocumentsContract.Document.COLUMN_FLAGS,
-            DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
-        )
+        row.add(DocumentsContract.Document.COLUMN_FLAGS, 0) // Read-only initially
     }
 
     private fun includeFileDocument(result: MatrixCursor, node: FileNodeModel) {
@@ -229,13 +321,8 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
         row.add(DocumentsContract.Document.COLUMN_SIZE, node.size)
         row.add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, node.mtime * 1000L)
 
-        var flags = DocumentsContract.Document.FLAG_SUPPORTS_DELETE or
-                DocumentsContract.Document.FLAG_SUPPORTS_RENAME
-
-        if (node.isDir) {
-            flags = flags or DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
-        } else {
-            flags = flags or DocumentsContract.Document.FLAG_SUPPORTS_WRITE
+        var flags = 0
+        if (!node.isDir) {
             if (mime.startsWith("image/") || mime.startsWith("video/")) {
                 flags = flags or DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL
             }
@@ -247,17 +334,5 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
     private fun getMimeTypeForName(name: String): String {
         val ext = name.substringAfterLast('.', "")
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext.lowercase()) ?: "application/octet-stream"
-    }
-
-    private fun buildDocId(accountId: String, fsId: Long): String = "doc_${accountId}_$fsId"
-
-    private fun parseDocId(documentId: String): Pair<String, Long> {
-        val parts = documentId.split("_")
-        if (parts.size >= 3) {
-            val accountId = parts[1]
-            val fsId = parts[2].toLongOrNull() ?: 0L
-            return Pair(accountId, fsId)
-        }
-        return Pair("default", 0L)
     }
 }
