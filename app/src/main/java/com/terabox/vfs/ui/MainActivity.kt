@@ -8,6 +8,7 @@ import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -127,6 +128,12 @@ class MainActivity : ComponentActivity() {
         // Pinning Progress
         var pinningProgress by remember { mutableStateOf<Pair<String, Float>?>(null) }
 
+        // Upload & File Ops State
+        var uploadProgress by remember { mutableStateOf<Pair<String, Float>?>(null) }
+        var showCreateFolderDialog by remember { mutableStateOf(false) }
+        var fileToRename by remember { mutableStateOf<FileEntity?>(null) }
+        var fileToDelete by remember { mutableStateOf<FileEntity?>(null) }
+
         // Google Sign-In Permission & Account State
         var pendingAccountForAuth by remember { mutableStateOf<android.accounts.Account?>(null) }
         var pendingGoogleAccount by remember { mutableStateOf<GoogleSignInAccount?>(null) }
@@ -164,7 +171,7 @@ class MainActivity : ComponentActivity() {
                             val listRes = app.apiClient.listFiles(
                                 accessToken = acc.accessToken,
                                 folderId = folderId,
-                                mediaOnly = true
+                                mediaOnly = false
                             )
 
                             if (listRes.isSuccess) {
@@ -224,7 +231,7 @@ class MainActivity : ComponentActivity() {
                             val token = GoogleAuthUtil.getToken(
                                 this@MainActivity,
                                 accObj,
-                                "oauth2:https://www.googleapis.com/auth/drive.readonly"
+                                "oauth2:https://www.googleapis.com/auth/drive"
                             )
                             Result.success(token)
                         } catch (e: Exception) {
@@ -277,7 +284,7 @@ class MainActivity : ComponentActivity() {
                                 val token = GoogleAuthUtil.getToken(
                                     this@MainActivity,
                                     accountObj,
-                                    "oauth2:https://www.googleapis.com/auth/drive.readonly"
+                                    "oauth2:https://www.googleapis.com/auth/drive"
                                 )
                                 Result.success(token)
                             } catch (e: UserRecoverableAuthException) {
@@ -338,7 +345,7 @@ class MainActivity : ComponentActivity() {
                 val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
                     .requestEmail()
                     .requestProfile()
-                    .requestScopes(Scope("https://www.googleapis.com/auth/drive.readonly"))
+                    .requestScopes(Scope("https://www.googleapis.com/auth/drive"))
                     .build()
                 val googleSignInClient = GoogleSignIn.getClient(this@MainActivity, gso)
                 googleSignInClient.signOut().addOnCompleteListener {
@@ -347,6 +354,116 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 Toast.makeText(this@MainActivity, "Cannot start Google Sign-In: ${e.message}", Toast.LENGTH_SHORT).show()
                 showLoginDialog = true
+            }
+        }
+
+        val filePickerLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.OpenMultipleDocuments()
+        ) { uris: List<Uri> ->
+            if (uris.isEmpty()) return@rememberLauncherForActivityResult
+            val acc = activeAccount
+            if (acc == null) {
+                Toast.makeText(this@MainActivity, "Please sign in to upload files", Toast.LENGTH_SHORT).show()
+                return@rememberLauncherForActivityResult
+            }
+
+            scope.launch {
+                val totalFiles = uris.size
+                var successCount = 0
+
+                for ((index, uri) in uris.withIndex()) {
+                    var displayName = "upload_${System.currentTimeMillis()}"
+                    var fileSize = 0L
+
+                    try {
+                        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                            if (cursor.moveToFirst()) {
+                                if (nameIdx != -1) displayName = cursor.getString(nameIdx) ?: displayName
+                                if (sizeIdx != -1) fileSize = cursor.getLong(sizeIdx)
+                            }
+                        }
+                    } catch (_: Exception) {}
+
+                    val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+
+                    uploadProgress = Pair("Uploading $displayName (${index + 1}/$totalFiles)...", 0.05f)
+
+                    val uploadResult = withContext(Dispatchers.IO) {
+                        try {
+                            val inputStream = contentResolver.openInputStream(uri)
+                                ?: return@withContext Result.failure<com.terabox.vfs.data.DriveFileItem>(java.io.IOException("Cannot open input stream for $displayName"))
+
+                            app.apiClient.uploadFile(
+                                accessToken = acc.accessToken,
+                                parentFolderId = currentFolderId,
+                                fileName = displayName,
+                                mimeType = mimeType,
+                                inputStream = inputStream,
+                                contentLength = fileSize,
+                                onProgress = { uploaded, total ->
+                                    val pct = if (total > 0) (uploaded.toFloat() / total.toFloat()).coerceIn(0f, 1f) else 0.5f
+                                    uploadProgress = Pair("Uploading $displayName (${index + 1}/$totalFiles) ${(pct * 100).toInt()}%", pct)
+                                }
+                            )
+                        } catch (e: Exception) {
+                            Result.failure(e)
+                        }
+                    }
+
+                    if (uploadResult.isSuccess) {
+                        val item = uploadResult.getOrThrow()
+                        val entity = FileEntity(
+                            id = item.id,
+                            name = item.name,
+                            mimeType = item.mimeType,
+                            parentId = currentFolderId,
+                            size = item.size,
+                            modifiedTime = System.currentTimeMillis(),
+                            md5Checksum = item.md5Checksum,
+                            thumbnailLink = item.thumbnailLink,
+                            isFolder = false
+                        )
+                        app.dbHelper.upsertFiles(listOf(entity))
+                        successCount++
+                    } else {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Failed to upload $displayName: ${uploadResult.exceptionOrNull()?.message}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+
+                uploadProgress = null
+                refreshDirectory(currentFolderId, forceCloud = true)
+                Toast.makeText(this@MainActivity, "Uploaded $successCount of $totalFiles files!", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        fun openNativeFilesApp() {
+            try {
+                val rootUri = DocumentsContract.buildRootUri(
+                    CloudSSDDocumentsProvider.AUTHORITY,
+                    "cloudssd_drive_root"
+                )
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(rootUri, DocumentsContract.Root.MIME_TYPE_ITEM)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+            } catch (e: Exception) {
+                try {
+                    val fallbackIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "*/*"
+                    }
+                    startActivity(fallbackIntent)
+                } catch (e2: Exception) {
+                    Toast.makeText(this@MainActivity, "Cannot open Files app: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
             }
         }
 
@@ -379,6 +496,17 @@ class MainActivity : ComponentActivity() {
                         titleContentColor = Color.White
                     ),
                     actions = {
+                        if (activeAccount != null) {
+                            IconButton(onClick = { showCreateFolderDialog = true }) {
+                                Icon(Icons.Default.CreateNewFolder, contentDescription = "New Folder", tint = Color(0xFFFFB74D))
+                            }
+                            IconButton(onClick = { filePickerLauncher.launch(arrayOf("*/*")) }) {
+                                Icon(Icons.Default.CloudUpload, contentDescription = "Upload to Drive", tint = Color(0xFF81C784))
+                            }
+                            IconButton(onClick = { openNativeFilesApp() }) {
+                                Icon(Icons.Default.FolderShared, contentDescription = "Open in Android Files App", tint = Color(0xFFFF8A65))
+                            }
+                        }
                         IconButton(onClick = { refreshDirectory(currentFolderId, forceCloud = true) }) {
                             Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Color(0xFF42A5F5))
                         }
@@ -549,6 +677,8 @@ class MainActivity : ComponentActivity() {
                                     Toast.makeText(this@MainActivity, "Cannot open: ${e.message}", Toast.LENGTH_SHORT).show()
                                 }
                             },
+                            onRenameClick = { fileToRename = it },
+                            onDeleteClick = { fileToDelete = it },
                             onSignInClick = { launchGoogleSignIn() },
                             onManualSignInClick = { showLoginDialog = true }
                         )
@@ -586,9 +716,102 @@ class MainActivity : ComponentActivity() {
                                 activeAccount = null
                                 Toast.makeText(this@MainActivity, "Signed out", Toast.LENGTH_SHORT).show()
                             },
-                            onSignInClick = { showLoginDialog = true }
+                            onSignInClick = { showLoginDialog = true },
+                            onOpenFilesApp = { openNativeFilesApp() }
                         )
                     }
+                }
+
+                // Upload Progress Dialog
+                uploadProgress?.let { (msg, prog) ->
+                    UploadProgressDialog(status = msg, progress = prog)
+                }
+
+                // Create Folder Dialog
+                if (showCreateFolderDialog) {
+                    CreateFolderDialog(
+                        onDismiss = { showCreateFolderDialog = false },
+                        onConfirm = { folderName ->
+                            val acc = activeAccount ?: return@CreateFolderDialog
+                            scope.launch {
+                                isLoading = true
+                                val res = withContext(Dispatchers.IO) {
+                                    app.apiClient.createFolder(acc.accessToken, currentFolderId, folderName)
+                                }
+                                isLoading = false
+                                if (res.isSuccess) {
+                                    val folder = res.getOrThrow()
+                                    val entity = FileEntity(
+                                        id = folder.id,
+                                        name = folder.name,
+                                        mimeType = folder.mimeType,
+                                        parentId = currentFolderId,
+                                        size = 0L,
+                                        modifiedTime = System.currentTimeMillis(),
+                                        md5Checksum = null,
+                                        thumbnailLink = null,
+                                        isFolder = true
+                                    )
+                                    app.dbHelper.upsertFiles(listOf(entity))
+                                    refreshDirectory(currentFolderId, forceCloud = true)
+                                    Toast.makeText(this@MainActivity, "Folder '$folderName' created!", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(this@MainActivity, "Create folder failed: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        }
+                    )
+                }
+
+                // Rename File Dialog
+                fileToRename?.let { item ->
+                    RenameFileDialog(
+                        item = item,
+                        onDismiss = { fileToRename = null },
+                        onConfirm = { newName ->
+                            val acc = activeAccount ?: return@RenameFileDialog
+                            scope.launch {
+                                isLoading = true
+                                val res = withContext(Dispatchers.IO) {
+                                    app.apiClient.renameFile(acc.accessToken, item.id, newName)
+                                }
+                                isLoading = false
+                                if (res.isSuccess) {
+                                    app.dbHelper.renameFile(item.id, newName)
+                                    refreshDirectory(currentFolderId, forceCloud = false)
+                                    Toast.makeText(this@MainActivity, "Renamed to '$newName'", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(this@MainActivity, "Rename failed: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        }
+                    )
+                }
+
+                // Delete Confirmation Dialog
+                fileToDelete?.let { item ->
+                    DeleteConfirmDialog(
+                        item = item,
+                        onDismiss = { fileToDelete = null },
+                        onConfirm = {
+                            val acc = activeAccount ?: return@DeleteConfirmDialog
+                            scope.launch {
+                                isLoading = true
+                                val res = withContext(Dispatchers.IO) {
+                                    app.apiClient.deleteFile(acc.accessToken, item.id)
+                                }
+                                isLoading = false
+                                if (res.isSuccess) {
+                                    app.dbHelper.deleteFile(item.id)
+                                    app.dbHelper.unpinFile(item.id)
+                                    refreshDirectory(currentFolderId, forceCloud = false)
+                                    Toast.makeText(this@MainActivity, "Deleted '${item.name}'", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(this@MainActivity, "Delete failed: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        }
+                    )
                 }
 
                 // Pinning Progress Dialog
@@ -659,6 +882,8 @@ class MainActivity : ComponentActivity() {
         onFileClick: (FileEntity) -> Unit,
         onPinClick: (FileEntity) -> Unit,
         onExternalOpen: (FileEntity) -> Unit,
+        onRenameClick: (FileEntity) -> Unit,
+        onDeleteClick: (FileEntity) -> Unit,
         onSignInClick: () -> Unit,
         onManualSignInClick: () -> Unit
     ) {
@@ -836,7 +1061,11 @@ class MainActivity : ComponentActivity() {
                     items(displayList) { item ->
                         MediaGridCard(
                             item = item,
-                            onClick = { if (item.isFolder) onFolderClick(item) else onFileClick(item) }
+                            onClick = { if (item.isFolder) onFolderClick(item) else onFileClick(item) },
+                            onRenameClick = { onRenameClick(item) },
+                            onDeleteClick = { onDeleteClick(item) },
+                            onPinClick = { onPinClick(item) },
+                            onExternalOpen = { onExternalOpen(item) }
                         )
                     }
                 }
@@ -847,7 +1076,9 @@ class MainActivity : ComponentActivity() {
                             item = item,
                             onItemClick = { if (item.isFolder) onFolderClick(item) else onFileClick(item) },
                             onPinClick = { onPinClick(item) },
-                            onExternalOpen = { onExternalOpen(item) }
+                            onExternalOpen = { onExternalOpen(item) },
+                            onRenameClick = { onRenameClick(item) },
+                            onDeleteClick = { onDeleteClick(item) }
                         )
                         Divider(color = Color(0xFF1E1E1E))
                     }
@@ -1137,7 +1368,8 @@ class MainActivity : ComponentActivity() {
     fun SettingsTab(
         account: DriveAccount?,
         onSignOut: () -> Unit,
-        onSignInClick: () -> Unit
+        onSignInClick: () -> Unit,
+        onOpenFilesApp: () -> Unit
     ) {
         var cacheCapGb by remember { mutableFloatStateOf(app.cacheManager.getCacheCapGb()) }
         var currentCacheMb by remember { mutableLongStateOf(app.cacheManager.getCurrentLruCacheSizeBytes() / (1024 * 1024)) }
@@ -1298,6 +1530,16 @@ class MainActivity : ComponentActivity() {
                         color = Color.White,
                         lineHeight = 16.sp
                     )
+                    Spacer(Modifier.height(10.dp))
+                    Button(
+                        onClick = onOpenFilesApp,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.FolderShared, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Open in Android Files App")
+                    }
                 }
             }
 
@@ -1322,7 +1564,9 @@ class MainActivity : ComponentActivity() {
         item: FileEntity,
         onItemClick: () -> Unit,
         onPinClick: () -> Unit,
-        onExternalOpen: () -> Unit
+        onExternalOpen: () -> Unit,
+        onRenameClick: () -> Unit,
+        onDeleteClick: () -> Unit
     ) {
         var showMenu by remember { mutableStateOf(false) }
         val isPinned = remember(item.id) { app.dbHelper.isPinned(item.id) }
@@ -1408,6 +1652,22 @@ class MainActivity : ComponentActivity() {
                             }
                         )
                     }
+                    DropdownMenuItem(
+                        text = { Text("Rename") },
+                        leadingIcon = { Icon(Icons.Default.DriveFileRenameOutline, contentDescription = null) },
+                        onClick = {
+                            showMenu = false
+                            onRenameClick()
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Delete", color = Color(0xFFEF5350)) },
+                        leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null, tint = Color(0xFFEF5350)) },
+                        onClick = {
+                            showMenu = false
+                            onDeleteClick()
+                        }
+                    )
                 }
             }
         }
@@ -1416,8 +1676,15 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun MediaGridCard(
         item: FileEntity,
-        onClick: () -> Unit
+        onClick: () -> Unit,
+        onRenameClick: () -> Unit,
+        onDeleteClick: () -> Unit,
+        onPinClick: () -> Unit,
+        onExternalOpen: () -> Unit
     ) {
+        var showMenu by remember { mutableStateOf(false) }
+        val isPinned = remember(item.id) { app.dbHelper.isPinned(item.id) }
+
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
             shape = RoundedCornerShape(10.dp),
@@ -1426,38 +1693,91 @@ class MainActivity : ComponentActivity() {
                 .aspectRatio(0.9f)
                 .clickable { onClick() }
         ) {
-            Column(
-                modifier = Modifier.padding(8.dp).fillMaxSize(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
-            ) {
-                Icon(
-                    imageVector = when {
-                        item.isFolder -> Icons.Default.Folder
-                        item.isVideo -> Icons.Default.Videocam
-                        item.isAudio -> Icons.Default.MusicNote
-                        item.isImage -> Icons.Default.Image
-                        else -> Icons.Default.InsertDriveFile
-                    },
-                    contentDescription = null,
-                    tint = when {
-                        item.isFolder -> Color(0xFFFFB74D)
-                        item.isVideo -> Color(0xFF42A5F5)
-                        item.isAudio -> Color(0xFF66BB6A)
-                        else -> Color(0xFFAB47BC)
-                    },
-                    modifier = Modifier.size(36.dp)
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = item.name,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = Color.White,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    textAlign = TextAlign.Center
-                )
+            Box(modifier = Modifier.fillMaxSize().padding(6.dp)) {
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Icon(
+                        imageVector = when {
+                            item.isFolder -> Icons.Default.Folder
+                            item.isVideo -> Icons.Default.Videocam
+                            item.isAudio -> Icons.Default.MusicNote
+                            item.isImage -> Icons.Default.Image
+                            else -> Icons.Default.InsertDriveFile
+                        },
+                        contentDescription = null,
+                        tint = when {
+                            item.isFolder -> Color(0xFFFFB74D)
+                            item.isVideo -> Color(0xFF42A5F5)
+                            item.isAudio -> Color(0xFF66BB6A)
+                            item.isImage -> Color(0xFFAB47BC)
+                            else -> Color.LightGray
+                        },
+                        modifier = Modifier.size(36.dp)
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = item.name,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color.White,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center
+                    )
+                }
+
+                Box(modifier = Modifier.align(Alignment.TopEnd)) {
+                    IconButton(
+                        onClick = { showMenu = true },
+                        modifier = Modifier.size(24.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.MoreVert,
+                            contentDescription = "Options",
+                            tint = Color.LightGray,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                        if (!item.isFolder) {
+                            DropdownMenuItem(
+                                text = { Text("Stream in VLC / Player") },
+                                leadingIcon = { Icon(Icons.Default.OpenInNew, contentDescription = null) },
+                                onClick = {
+                                    showMenu = false
+                                    onExternalOpen()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text(if (isPinned) "Already Pinned" else "Pin for Offline") },
+                                leadingIcon = { Icon(Icons.Default.PushPin, contentDescription = null) },
+                                onClick = {
+                                    showMenu = false
+                                    onPinClick()
+                                }
+                            )
+                        }
+                        DropdownMenuItem(
+                            text = { Text("Rename") },
+                            leadingIcon = { Icon(Icons.Default.DriveFileRenameOutline, contentDescription = null) },
+                            onClick = {
+                                showMenu = false
+                                onRenameClick()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Delete", color = Color(0xFFEF5350)) },
+                            leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null, tint = Color(0xFFEF5350)) },
+                            onClick = {
+                                showMenu = false
+                                onDeleteClick()
+                            }
+                        )
+                    }
+                }
             }
         }
     }
@@ -1609,7 +1929,7 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.height(8.dp))
                         OutlinedButton(
                             onClick = {
-                                val url = "https://developers.google.com/oauthplayground/#step1&scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly"
+                                val url = "https://developers.google.com/oauthplayground/#step1&scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive"
                                 val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
                                 startActivity(intent)
                             },
@@ -1678,6 +1998,185 @@ class MainActivity : ComponentActivity() {
                 TextButton(onClick = onDismiss) { Text("Cancel", color = Color.Gray) }
             }
         )
+    }
+
+    @Composable
+    fun CreateFolderDialog(
+        onDismiss: () -> Unit,
+        onConfirm: (String) -> Unit
+    ) {
+        var folderName by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.CreateNewFolder, contentDescription = null, tint = Color(0xFFFFB74D))
+                    Spacer(Modifier.width(8.dp))
+                    Text("New Folder", fontWeight = FontWeight.Bold)
+                }
+            },
+            text = {
+                Column {
+                    Text("Enter a name for the new folder:", fontSize = 13.sp, color = Color.Gray)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = folderName,
+                        onValueChange = { folderName = it },
+                        placeholder = { Text("Folder Name") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (folderName.isNotBlank()) {
+                            onConfirm(folderName.trim())
+                            onDismiss()
+                        }
+                    },
+                    enabled = folderName.isNotBlank()
+                ) {
+                    Text("Create")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    @Composable
+    fun RenameFileDialog(
+        item: FileEntity,
+        onDismiss: () -> Unit,
+        onConfirm: (String) -> Unit
+    ) {
+        var newName by remember { mutableStateOf(item.name) }
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.DriveFileRenameOutline, contentDescription = null, tint = Color(0xFF42A5F5))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Rename ${if (item.isFolder) "Folder" else "File"}", fontWeight = FontWeight.Bold)
+                }
+            },
+            text = {
+                Column {
+                    Text("Enter a new name:", fontSize = 13.sp, color = Color.Gray)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = newName,
+                        onValueChange = { newName = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (newName.isNotBlank() && newName.trim() != item.name) {
+                            onConfirm(newName.trim())
+                            onDismiss()
+                        }
+                    },
+                    enabled = newName.isNotBlank() && newName.trim() != item.name
+                ) {
+                    Text("Rename")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    @Composable
+    fun DeleteConfirmDialog(
+        item: FileEntity,
+        onDismiss: () -> Unit,
+        onConfirm: () -> Unit
+    ) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Delete, contentDescription = null, tint = Color(0xFFEF5350))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Delete ${if (item.isFolder) "Folder" else "File"}", fontWeight = FontWeight.Bold)
+                }
+            },
+            text = {
+                Text(
+                    "Are you sure you want to delete '${item.name}' from Google Drive? This action cannot be undone.",
+                    fontSize = 13.sp,
+                    color = Color.LightGray
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onConfirm()
+                        onDismiss()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    @Composable
+    fun UploadProgressDialog(
+        status: String,
+        progress: Float
+    ) {
+        Dialog(onDismissRequest = {}) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF222222)),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth().padding(16.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.CloudUpload, contentDescription = null, tint = Color(0xFF42A5F5), modifier = Modifier.size(24.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Uploading to Google Drive", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.White)
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        text = status,
+                        fontSize = 12.sp,
+                        color = Color.LightGray,
+                        textAlign = TextAlign.Center,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
+                        color = Color(0xFF42A5F5)
+                    )
+                }
+            }
+        }
     }
 
     private fun isNetworkAvailable(context: Context): Boolean {

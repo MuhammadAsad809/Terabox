@@ -247,6 +247,15 @@ class CloudSSDDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATAB
         db.delete(TABLE_FILES, "id = ?", arrayOf(id))
     }
 
+    fun renameFile(id: String, newName: String) {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            put("name", newName)
+            put("modified_time", System.currentTimeMillis())
+        }
+        db.update(TABLE_FILES, values, "id = ?", arrayOf(id))
+    }
+
     // --- Pinned Operations ---
 
     fun pinFile(fileId: String, localPath: String, size: Long) {

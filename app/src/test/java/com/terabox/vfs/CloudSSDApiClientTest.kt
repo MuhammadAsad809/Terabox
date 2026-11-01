@@ -120,4 +120,41 @@ class CloudSSDApiClientTest {
         val fallbackKey = "cloudssd_${fileId}_v1"
         assertEquals("cloudssd_video_999_v1", fallbackKey)
     }
+
+    @Test
+    fun testDriveFolderCreationParsing() {
+        val rawJson = """
+            {
+                "id": "new_folder_999",
+                "name": "My New Folder",
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": ["root"],
+                "size": "0"
+            }
+        """.trimIndent()
+        val item = gson.fromJson(rawJson, DriveFileItem::class.java)
+        assertEquals("new_folder_999", item.id)
+        assertEquals("My New Folder", item.name)
+        assertTrue(item.isFolder)
+    }
+
+    @Test
+    fun testDriveFileUploadParsing() {
+        val rawJson = """
+            {
+                "id": "uploaded_file_111",
+                "name": "Presentation.pdf",
+                "mimeType": "application/pdf",
+                "parents": ["root"],
+                "size": "204800",
+                "md5Checksum": "d41d8cd98f00b204e9800998ecf8427e"
+            }
+        """.trimIndent()
+        val item = gson.fromJson(rawJson, DriveFileItem::class.java)
+        assertEquals("uploaded_file_111", item.id)
+        assertEquals("Presentation.pdf", item.name)
+        assertEquals(204800L, item.size)
+        assertFalse(item.isFolder)
+        assertEquals("d41d8cd98f00b204e9800998ecf8427e", item.md5Checksum)
+    }
 }

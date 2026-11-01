@@ -4,9 +4,12 @@ import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.annotations.SerializedName
 import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
@@ -322,6 +325,193 @@ class GoogleDriveApiClient(
             val body = response.body?.string() ?: return Result.failure(IOException("Empty token response"))
             val tokenResponse = gson.fromJson(body, OAuthTokenResponse::class.java)
             Result.success(tokenResponse)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Creates a new folder on Google Drive.
+     */
+    fun createFolder(
+        accessToken: String,
+        parentFolderId: String,
+        folderName: String
+    ): Result<DriveFileItem> {
+        val parent = if (parentFolderId.isBlank() || parentFolderId == "root") "root" else parentFolderId
+        val json = JsonObject().apply {
+            addProperty("name", folderName)
+            addProperty("mimeType", "application/vnd.google-apps.folder")
+            val parentsArr = com.google.gson.JsonArray().apply { add(parent) }
+            add("parents", parentsArr)
+        }
+
+        val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
+        val requestBody = json.toString().toRequestBody(mediaType)
+
+        val request = Request.Builder()
+            .url("$BASE_URL/files?fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,thumbnailLink")
+            .header("User-Agent", USER_AGENT)
+            .header("Authorization", "Bearer $accessToken")
+            .post(requestBody)
+            .build()
+
+        return try {
+            val response = httpClient.newCall(request).execute()
+            if (response.code == 401) return Result.failure(DriveSessionExpiredException())
+            if (!response.isSuccessful) return Result.failure(IOException("Create folder failed: HTTP ${response.code}"))
+
+            val body = response.body?.string() ?: return Result.failure(IOException("Empty response"))
+            val item = gson.fromJson(body, DriveFileItem::class.java)
+            Result.success(item)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Renames a file or folder on Google Drive.
+     */
+    fun renameFile(
+        accessToken: String,
+        fileId: String,
+        newName: String
+    ): Result<DriveFileItem> {
+        val json = JsonObject().apply {
+            addProperty("name", newName)
+        }
+
+        val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
+        val requestBody = json.toString().toRequestBody(mediaType)
+
+        val request = Request.Builder()
+            .url("$BASE_URL/files/$fileId?fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,thumbnailLink")
+            .header("User-Agent", USER_AGENT)
+            .header("Authorization", "Bearer $accessToken")
+            .patch(requestBody)
+            .build()
+
+        return try {
+            val response = httpClient.newCall(request).execute()
+            if (response.code == 401) return Result.failure(DriveSessionExpiredException())
+            if (!response.isSuccessful) return Result.failure(IOException("Rename failed: HTTP ${response.code}"))
+
+            val body = response.body?.string() ?: return Result.failure(IOException("Empty response"))
+            val item = gson.fromJson(body, DriveFileItem::class.java)
+            Result.success(item)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Deletes a file or folder on Google Drive.
+     */
+    fun deleteFile(
+        accessToken: String,
+        fileId: String
+    ): Result<Unit> {
+        val request = Request.Builder()
+            .url("$BASE_URL/files/$fileId")
+            .header("User-Agent", USER_AGENT)
+            .header("Authorization", "Bearer $accessToken")
+            .delete()
+            .build()
+
+        return try {
+            val response = httpClient.newCall(request).execute()
+            if (response.code == 401) return Result.failure(DriveSessionExpiredException())
+            if (response.isSuccessful || response.code == 204 || response.code == 404) {
+                Result.success(Unit)
+            } else {
+                Result.failure(IOException("Delete failed: HTTP ${response.code}"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Uploads a file directly to Google Drive with progress reporting using Resumable Upload.
+     */
+    fun uploadFile(
+        accessToken: String,
+        parentFolderId: String,
+        fileName: String,
+        mimeType: String,
+        inputStream: InputStream,
+        contentLength: Long,
+        onProgress: (Long, Long) -> Unit
+    ): Result<DriveFileItem> {
+        val parent = if (parentFolderId.isBlank() || parentFolderId == "root") "root" else parentFolderId
+        val metadataJson = JsonObject().apply {
+            addProperty("name", fileName)
+            val parentsArr = com.google.gson.JsonArray().apply { add(parent) }
+            add("parents", parentsArr)
+        }
+
+        // 1. Initiate Resumable Upload Session
+        val initUrl = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,thumbnailLink"
+        val jsonMediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
+        val initBody = metadataJson.toString().toRequestBody(jsonMediaType)
+
+        val cleanMime = if (mimeType.isBlank()) "application/octet-stream" else mimeType
+        val initRequest = Request.Builder()
+            .url(initUrl)
+            .header("User-Agent", USER_AGENT)
+            .header("Authorization", "Bearer $accessToken")
+            .header("X-Upload-Content-Type", cleanMime)
+            .header("X-Upload-Content-Length", contentLength.toString())
+            .post(initBody)
+            .build()
+
+        val uploadUrl: String
+        try {
+            val initResponse = httpClient.newCall(initRequest).execute()
+            if (initResponse.code == 401) return Result.failure(DriveSessionExpiredException())
+            if (!initResponse.isSuccessful) {
+                return Result.failure(IOException("Initiate upload failed: HTTP ${initResponse.code}"))
+            }
+            uploadUrl = initResponse.header("Location") ?: return Result.failure(IOException("Missing upload Location header"))
+        } catch (e: Exception) {
+            return Result.failure(e)
+        }
+
+        // 2. Stream Data to Resumable Upload URL with Progress
+        val progressBody = object : RequestBody() {
+            override fun contentType(): MediaType? = cleanMime.toMediaTypeOrNull()
+
+            override fun contentLength(): Long = contentLength
+
+            override fun writeTo(sink: okio.BufferedSink) {
+                val buffer = ByteArray(64 * 1024)
+                var bytesUploaded = 0L
+                var read: Int
+                inputStream.use { stream ->
+                    while (stream.read(buffer).also { read = it } != -1) {
+                        sink.write(buffer, 0, read)
+                        bytesUploaded += read
+                        onProgress(bytesUploaded, contentLength)
+                    }
+                }
+            }
+        }
+
+        val uploadRequest = Request.Builder()
+            .url(uploadUrl)
+            .header("User-Agent", USER_AGENT)
+            .put(progressBody)
+            .build()
+
+        return try {
+            val uploadResponse = httpClient.newCall(uploadRequest).execute()
+            if (!uploadResponse.isSuccessful) {
+                return Result.failure(IOException("Upload failed: HTTP ${uploadResponse.code}"))
+            }
+
+            val body = uploadResponse.body?.string() ?: return Result.failure(IOException("Empty upload response"))
+            val item = gson.fromJson(body, DriveFileItem::class.java)
+            Result.success(item)
         } catch (e: Exception) {
             Result.failure(e)
         }

@@ -82,7 +82,10 @@ class CloudSSDDocumentsProvider : DocumentsProvider() {
         )
         row.add(
             Root.COLUMN_FLAGS,
-            Root.FLAG_SUPPORTS_IS_CHILD or Root.FLAG_SUPPORTS_RECENTS or Root.FLAG_SUPPORTS_SEARCH
+            Root.FLAG_SUPPORTS_IS_CHILD or
+            Root.FLAG_SUPPORTS_RECENTS or
+            Root.FLAG_SUPPORTS_SEARCH or
+            Root.FLAG_SUPPORTS_CREATE
         )
         row.add(Root.COLUMN_MIME_TYPES, "*/*")
         row.add(Root.COLUMN_AVAILABLE_BYTES, available)
@@ -101,7 +104,10 @@ class CloudSSDDocumentsProvider : DocumentsProvider() {
             row.add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR)
             row.add(Document.COLUMN_DISPLAY_NAME, "CloudSSD Media")
             row.add(Document.COLUMN_LAST_MODIFIED, System.currentTimeMillis())
-            row.add(Document.COLUMN_FLAGS, Document.FLAG_DIR_PREFERS_GRID)
+            row.add(
+                Document.COLUMN_FLAGS,
+                Document.FLAG_DIR_SUPPORTS_CREATE or Document.FLAG_DIR_PREFERS_GRID
+            )
             row.add(Document.COLUMN_SIZE, 0L)
             return result
         }
@@ -227,6 +233,82 @@ class CloudSSDDocumentsProvider : DocumentsProvider() {
         return false
     }
 
+    override fun createDocument(
+        parentDocumentId: String,
+        mimeType: String,
+        displayName: String
+    ): String {
+        val activeAccount = app.dbHelper.getActiveAccount()
+            ?: throw FileNotFoundException("No active Google Drive account")
+
+        return runBlocking {
+            if (mimeType == Document.MIME_TYPE_DIR) {
+                val res = app.apiClient.createFolder(activeAccount.accessToken, parentDocumentId, displayName)
+                val folder = res.getOrNull()
+                    ?: throw FileNotFoundException("Cannot create folder: ${res.exceptionOrNull()?.message}")
+                val entity = FileEntity(
+                    id = folder.id,
+                    name = folder.name,
+                    mimeType = folder.mimeType,
+                    parentId = parentDocumentId,
+                    size = 0L,
+                    modifiedTime = System.currentTimeMillis(),
+                    md5Checksum = null,
+                    thumbnailLink = null,
+                    isFolder = true
+                )
+                app.dbHelper.upsertFiles(listOf(entity))
+                entity.id
+            } else {
+                val emptyStream = java.io.ByteArrayInputStream(ByteArray(0))
+                val res = app.apiClient.uploadFile(
+                    accessToken = activeAccount.accessToken,
+                    parentFolderId = parentDocumentId,
+                    fileName = displayName,
+                    mimeType = mimeType,
+                    inputStream = emptyStream,
+                    contentLength = 0L,
+                    onProgress = { _, _ -> }
+                )
+                val item = res.getOrNull()
+                    ?: throw FileNotFoundException("Cannot create document: ${res.exceptionOrNull()?.message}")
+                val entity = FileEntity(
+                    id = item.id,
+                    name = item.name,
+                    mimeType = item.mimeType,
+                    parentId = parentDocumentId,
+                    size = item.size,
+                    modifiedTime = System.currentTimeMillis(),
+                    md5Checksum = item.md5Checksum,
+                    thumbnailLink = item.thumbnailLink,
+                    isFolder = false
+                )
+                app.dbHelper.upsertFiles(listOf(entity))
+                entity.id
+            }
+        }
+    }
+
+    override fun deleteDocument(documentId: String) {
+        val activeAccount = app.dbHelper.getActiveAccount() ?: return
+        runBlocking {
+            app.apiClient.deleteFile(activeAccount.accessToken, documentId)
+            app.dbHelper.deleteFile(documentId)
+            app.dbHelper.unpinFile(documentId)
+        }
+    }
+
+    override fun renameDocument(documentId: String, displayName: String): String {
+        val activeAccount = app.dbHelper.getActiveAccount() ?: return documentId
+        return runBlocking {
+            val res = app.apiClient.renameFile(activeAccount.accessToken, documentId, displayName)
+            if (res.isSuccess) {
+                app.dbHelper.renameFile(documentId, displayName)
+            }
+            documentId
+        }
+    }
+
     private fun includeFile(result: MatrixCursor, file: FileEntity) {
         val row = result.newRow()
         row.add(Document.COLUMN_DOCUMENT_ID, file.id)
@@ -237,7 +319,9 @@ class CloudSSDDocumentsProvider : DocumentsProvider() {
 
         var flags = 0
         if (file.isFolder) {
-            flags = flags or Document.FLAG_DIR_PREFERS_GRID
+            flags = flags or Document.FLAG_DIR_SUPPORTS_CREATE or Document.FLAG_DIR_PREFERS_GRID
+        } else {
+            flags = flags or Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
         }
         row.add(Document.COLUMN_FLAGS, flags)
     }
