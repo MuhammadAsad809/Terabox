@@ -1,7 +1,7 @@
 package com.terabox.vfs.cache
 
 import android.content.Context
-import androidx.annotation.OptIn
+import kotlin.OptIn
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor

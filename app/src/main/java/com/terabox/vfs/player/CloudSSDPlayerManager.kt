@@ -2,7 +2,7 @@ package com.terabox.vfs.player
 
 import android.content.Context
 import android.net.Uri
-import androidx.annotation.OptIn
+import kotlin.OptIn
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackParameters
