@@ -1328,15 +1328,36 @@ class MainActivity : ComponentActivity() {
             text = {
                 Column {
                     Text(
-                        "Enter your Google OAuth2 Access Token (scope: drive.readonly) to connect your Google Drive extra storage:",
+                        "Google Drive connect karne ke liye apna Access Token (ya29....) yahan paste karein:",
                         fontSize = 13.sp,
                         color = Color.LightGray
                     )
-                    Spacer(Modifier.height(12.dp))
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = {
+                            val url = "https://developers.google.com/oauthplayground/#step1&scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly"
+                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                            startActivity(intent)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF42A5F5))
+                    ) {
+                        Icon(Icons.Default.OpenInBrowser, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("1-Tap: Get Token in Browser", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "Tariqa:\n1. Upar 'Get Token' button dabayein\n2. 'Authorize APIs' par tap karke apna Google Account select karein\n3. 'Exchange authorization code' dabayein aur Access Token copy karein",
+                        fontSize = 11.sp,
+                        color = Color.Gray,
+                        lineHeight = 16.sp
+                    )
+                    Spacer(Modifier.height(10.dp))
                     OutlinedTextField(
                         value = tokenInput,
                         onValueChange = { tokenInput = it },
-                        placeholder = { Text("Paste Bearer ya29....") },
+                        placeholder = { Text("Paste ya29.... yahan", fontSize = 12.sp) },
                         modifier = Modifier.fillMaxWidth(),
                         maxLines = 3
                     )
