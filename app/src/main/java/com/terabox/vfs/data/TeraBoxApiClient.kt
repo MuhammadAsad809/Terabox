@@ -3,10 +3,13 @@ package com.terabox.vfs.data
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.annotations.SerializedName
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okio.BufferedSink
+import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
@@ -33,6 +36,27 @@ data class TeraBoxItem(
     val thumbs: JsonObject? = null
 )
 
+class ProgressRequestBody(
+    private val inputStream: InputStream,
+    private val totalBytes: Long,
+    private val contentType: String = "application/octet-stream",
+    private val onProgress: (uploaded: Long, total: Long) -> Unit
+) : RequestBody() {
+    override fun contentType() = contentType.toMediaTypeOrNull()
+    override fun contentLength() = totalBytes
+
+    override fun writeTo(sink: BufferedSink) {
+        val buffer = ByteArray(8192)
+        var uploaded = 0L
+        var read: Int
+        while (inputStream.read(buffer).also { read = it } != -1) {
+            sink.write(buffer, 0, read)
+            uploaded += read
+            onProgress(uploaded, totalBytes)
+        }
+    }
+}
+
 class TeraBoxApiClient {
 
     companion object {
@@ -44,8 +68,8 @@ class TeraBoxApiClient {
 
     val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
     private val gson = Gson()
@@ -182,6 +206,199 @@ class TeraBoxApiClient {
                 }
             }
             Result.failure(IOException("No direct download link returned for fsId=$fsId"))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Downloads a file directly to a destination File on device storage with progress callback.
+     */
+    fun downloadFile(
+        dlink: String,
+        ndus: String,
+        destFile: File,
+        onProgress: (downloaded: Long, total: Long) -> Unit
+    ): Result<File> {
+        val request = Request.Builder()
+            .url(dlink)
+            .header("User-Agent", USER_AGENT)
+            .header("Cookie", "ndus=$ndus;")
+            .header("Referer", "$BASE_URL/main")
+            .build()
+
+        return try {
+            val response = httpClient.newCall(request).execute()
+            if (!response.isSuccessful) {
+                return Result.failure(IOException("Download failed with HTTP ${response.code}"))
+            }
+            val body = response.body ?: return Result.failure(IOException("Empty download body"))
+            val totalBytes = body.contentLength()
+            val parent = destFile.parentFile
+            if (parent != null && !parent.exists()) parent.mkdirs()
+
+            body.byteStream().use { input ->
+                FileOutputStream(destFile).use { output ->
+                    val buffer = ByteArray(32768)
+                    var bytesRead: Int
+                    var downloaded = 0L
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                        downloaded += bytesRead
+                        onProgress(downloaded, totalBytes)
+                    }
+                    output.flush()
+                }
+            }
+            Result.success(destFile)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Uploads a local file/stream directly to TeraBox cloud with live progress reporting.
+     */
+    fun uploadFile(
+        ndus: String,
+        remotePath: String,
+        filename: String,
+        inputStream: InputStream,
+        fileSize: Long,
+        onProgress: (uploaded: Long, total: Long) -> Unit
+    ): Result<Boolean> {
+        val encodedPath = URLEncoder.encode(remotePath, "UTF-8")
+        val url = "$BASE_URL/rest/2.0/pcs/file?method=upload&path=$encodedPath&ondup=overwrite"
+
+        val progressBody = ProgressRequestBody(inputStream, fileSize) { up, tot ->
+            onProgress(up, tot)
+        }
+
+        val multipartBody = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("file", filename, progressBody)
+            .build()
+
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Cookie", "ndus=$ndus;")
+            .header("Referer", "$BASE_URL/main")
+            .post(multipartBody)
+            .build()
+
+        return try {
+            val response = httpClient.newCall(request).execute()
+            val body = response.body?.string() ?: ""
+            val json = gson.fromJson(body, JsonObject::class.java)
+            val errno = json.get("errno")?.asInt ?: 0
+            if (errno == 0 || json.has("fs_id")) {
+                Result.success(true)
+            } else {
+                Result.failure(IOException("Upload failed: errno=$errno, body=$body"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Creates a new directory in TeraBox cloud.
+     */
+    fun createFolder(ndus: String, folderPath: String): Result<Boolean> {
+        val url = "$BASE_URL/api/create"
+        val formBody = FormBody.Builder()
+            .add("path", folderPath)
+            .add("isdir", "1")
+            .add("size", "0")
+            .add("uploadid", "")
+            .add("block_list", "[]")
+            .build()
+
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Cookie", "ndus=$ndus;")
+            .header("Referer", "$BASE_URL/main")
+            .post(formBody)
+            .build()
+
+        return try {
+            val response = httpClient.newCall(request).execute()
+            val body = response.body?.string() ?: ""
+            val json = gson.fromJson(body, JsonObject::class.java)
+            val errno = json.get("errno")?.asInt ?: -1
+            if (errno == 0 || errno == -8) { // 0: success, -8: directory already exists
+                Result.success(true)
+            } else {
+                Result.failure(IOException("Failed to create folder: errno=$errno"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Deletes a file or directory in TeraBox cloud.
+     */
+    fun deleteItem(ndus: String, remotePath: String): Result<Boolean> {
+        val url = "$BASE_URL/api/filemanager?opera=delete"
+        val fileListJson = "[\"$remotePath\"]"
+        val formBody = FormBody.Builder()
+            .add("filelist", fileListJson)
+            .build()
+
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Cookie", "ndus=$ndus;")
+            .header("Referer", "$BASE_URL/main")
+            .post(formBody)
+            .build()
+
+        return try {
+            val response = httpClient.newCall(request).execute()
+            val body = response.body?.string() ?: ""
+            val json = gson.fromJson(body, JsonObject::class.java)
+            val errno = json.get("errno")?.asInt ?: -1
+            if (errno == 0) {
+                Result.success(true)
+            } else {
+                Result.failure(IOException("Delete failed: errno=$errno"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Renames a file or directory in TeraBox cloud.
+     */
+    fun renameItem(ndus: String, remotePath: String, newName: String): Result<Boolean> {
+        val url = "$BASE_URL/api/filemanager?opera=rename"
+        val fileListJson = "[{\"path\":\"$remotePath\",\"newname\":\"$newName\"}]"
+        val formBody = FormBody.Builder()
+            .add("filelist", fileListJson)
+            .build()
+
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Cookie", "ndus=$ndus;")
+            .header("Referer", "$BASE_URL/main")
+            .post(formBody)
+            .build()
+
+        return try {
+            val response = httpClient.newCall(request).execute()
+            val body = response.body?.string() ?: ""
+            val json = gson.fromJson(body, JsonObject::class.java)
+            val errno = json.get("errno")?.asInt ?: -1
+            if (errno == 0) {
+                Result.success(true)
+            } else {
+                Result.failure(IOException("Rename failed: errno=$errno"))
+            }
         } catch (e: Exception) {
             Result.failure(e)
         }

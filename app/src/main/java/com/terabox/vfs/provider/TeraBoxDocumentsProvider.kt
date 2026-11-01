@@ -297,6 +297,50 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
         }
     }
 
+    override fun deleteDocument(documentId: String) {
+        val (accountId, fsId) = parseDocId(documentId)
+        val app = TeraBoxApp.instance
+        val account = app.dbHelper.getAccount(accountId) ?: return
+        val node = app.dbHelper.getNode(fsId) ?: return
+
+        try {
+            val res = apiClient.deleteItem(account.ndus, node.path)
+            if (res.isSuccess) {
+                app.dbHelper.deleteNode(fsId)
+                context?.contentResolver?.notifyChange(
+                    DocumentsContract.buildRootsUri(AUTHORITY),
+                    null
+                )
+            }
+        } catch (e: Exception) {
+            throw IOException("Failed to delete document: ${e.message}")
+        }
+    }
+
+    override fun renameDocument(documentId: String, displayName: String): String {
+        val (accountId, fsId) = parseDocId(documentId)
+        val app = TeraBoxApp.instance
+        val account = app.dbHelper.getAccount(accountId) ?: throw FileNotFoundException("Account not found")
+        val node = app.dbHelper.getNode(fsId) ?: throw FileNotFoundException("Document not found")
+
+        try {
+            val res = apiClient.renameItem(account.ndus, node.path, displayName)
+            if (res.isSuccess) {
+                val newPath = node.path.substringBeforeLast('/') + "/$displayName"
+                app.dbHelper.renameNode(fsId, displayName, newPath)
+                context?.contentResolver?.notifyChange(
+                    DocumentsContract.buildRootsUri(AUTHORITY),
+                    null
+                )
+                return documentId
+            } else {
+                throw IOException("Rename failed on remote storage")
+            }
+        } catch (e: Exception) {
+            throw IOException("Failed to rename document: ${e.message}")
+        }
+    }
+
     private fun includeRootDocument(result: MatrixCursor, docId: String, title: String) {
         val row = result.newRow()
         row.add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, docId)
@@ -304,7 +348,7 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
         row.add(DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.MIME_TYPE_DIR)
         row.add(DocumentsContract.Document.COLUMN_SIZE, 0L)
         row.add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, System.currentTimeMillis())
-        row.add(DocumentsContract.Document.COLUMN_FLAGS, 0) // Read-only initially
+        row.add(DocumentsContract.Document.COLUMN_FLAGS, 0)
     }
 
     private fun includeFileDocument(result: MatrixCursor, node: FileNodeModel) {
@@ -321,7 +365,9 @@ class TeraBoxDocumentsProvider : DocumentsProvider() {
         row.add(DocumentsContract.Document.COLUMN_SIZE, node.size)
         row.add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, node.mtime * 1000L)
 
-        var flags = 0
+        var flags = DocumentsContract.Document.FLAG_SUPPORTS_DELETE or
+                DocumentsContract.Document.FLAG_SUPPORTS_RENAME
+
         if (!node.isDir) {
             if (mime.startsWith("image/") || mime.startsWith("video/")) {
                 flags = flags or DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL

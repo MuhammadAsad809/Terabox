@@ -288,6 +288,20 @@ class TeraBoxDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABA
         db.update(TABLE_NODES, values, "fs_id = ?", arrayOf(fsId.toString()))
     }
 
+    fun deleteNode(fsId: Long) {
+        val db = writableDatabase
+        db.delete(TABLE_NODES, "fs_id = ?", arrayOf(fsId.toString()))
+    }
+
+    fun renameNode(fsId: Long, newFilename: String, newPath: String) {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            put("filename", newFilename)
+            put("path", newPath)
+        }
+        db.update(TABLE_NODES, values, "fs_id = ?", arrayOf(fsId.toString()))
+    }
+
     private fun extractNode(cursor: Cursor): FileNodeModel {
         return FileNodeModel(
             fsId = cursor.getLong(cursor.getColumnIndexOrThrow("fs_id")),
