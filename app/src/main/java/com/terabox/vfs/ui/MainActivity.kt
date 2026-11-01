@@ -307,10 +307,11 @@ class MainActivity : ComponentActivity() {
                             Toast.makeText(this@MainActivity, "Signed in as ${acc.displayName}!", Toast.LENGTH_LONG).show()
                         } else {
                             val ex = tokenResult.exceptionOrNull()
-                            if (ex is UserRecoverableAuthException) {
+                            val recoveryIntent = (ex as? UserRecoverableAuthException)?.intent
+                            if (recoveryIntent != null) {
                                 pendingAccountForAuth = accountObj
                                 pendingGoogleAccount = googleAccount
-                                recoverableAuthLauncher.launch(ex.intent)
+                                recoverableAuthLauncher.launch(recoveryIntent)
                             } else {
                                 Toast.makeText(this@MainActivity, "Google Sign-In: ${ex?.message ?: "Failed"}", Toast.LENGTH_LONG).show()
                                 showLoginDialog = true
