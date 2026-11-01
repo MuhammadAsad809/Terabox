@@ -48,6 +48,7 @@ import com.terabox.vfs.TeraBoxApp
 import com.terabox.vfs.data.DriveAccount
 import com.terabox.vfs.data.DriveSessionExpiredException
 import com.terabox.vfs.data.FileEntity
+import com.terabox.vfs.data.GoogleDriveApiClient
 import com.terabox.vfs.data.PinnedEntity
 import com.terabox.vfs.provider.CloudSSDDocumentsProvider
 import kotlinx.coroutines.Dispatchers
@@ -58,7 +59,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 
-@OptIn(UnstableApi::class)
+@OptIn(UnstableApi::class, ExperimentalMaterial3Api::class)
 class MainActivity : ComponentActivity() {
 
     private val app by lazy { TeraBoxApp.instance }
