@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TeraBox Virtual Cloud Storage</string>
+    <string name="provider_label">TeraBox Cloud Drive</string>
+    <string name="sync_channel_name">TeraBox Sync</string>
+    <string name="upload_channel_name">TeraBox Uploads</string>
+</resources>
